@@ -17,8 +17,9 @@
 ### 2. Update Frontend Configuration
 1. In Render Dashboard, go to **ai-lighting-ui** service
 2. Go to "Environment" tab
-3. Update `VITE_API_URL` with your actual backend URL
+3. Update `VITE_API_URL` with your actual backend URL (without trailing slash)
 4. Example: `https://ai-lighting-api.onrender.com`
+5. **Important**: Do NOT include `/api` in the URL - just the base domain
 
 ### 3. Deploy Frontend
 1. Trigger a manual deploy or push a new commit

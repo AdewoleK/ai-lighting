@@ -18,10 +18,14 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 
 // ─── API base ─────────────────────────────────────────────────────────────────
-// In dev: Vite proxies /api/* → localhost:8000
-// In prod: set VITE_API_URL to the backend origin
-const API = (import.meta.env.VITE_API_URL ?? '') + ''
-const endpoint = path => `${API}/api${path}`
+// In dev: Vite proxies /api/* → localhost:8000 and strips /api prefix
+// In prod: VITE_API_URL points directly to backend, no /api prefix needed
+const API = import.meta.env.VITE_API_URL ?? ''
+const endpoint = path => {
+  // If API is set (production), use it directly without /api prefix
+  // If API is empty (dev), use /api prefix for Vite proxy
+  return API ? `${API}${path}` : `/api${path}`
+}
 
 // ─── Zone colours ─────────────────────────────────────────────────────────────
 const ZONE_COLOR = {

@@ -10,26 +10,20 @@ services:
         value: "3.11"
       - key: API_HOST
         value: "0.0.0.0"
-      - key: API_PORT
-        sync: false
-        value: "$PORT"
     healthCheckPath: /health
     autoDeploy: true
 
-  # React Frontend
+  # React Frontend (Static Site)
   - type: web
     name: ai-lighting-ui
-    runtime: node
+    runtime: static
     buildCommand: "cd ui && npm install && npm run build"
     staticPublishPath: ./ui/dist
     envVars:
       - key: NODE_VERSION
         value: "18"
-      # You'll need to set this to your backend URL after deploying
+      # Update this to your actual backend URL after deploying the API
+      # Format: https://your-api-name.onrender.com (no trailing slash, no /api)
       - key: VITE_API_URL
         value: "https://ai-lighting-api.onrender.com"
-    routes:
-      - type: rewrite
-        source: /api/*
-        destination: https://ai-lighting-api.onrender.com/*
     autoDeploy: true
