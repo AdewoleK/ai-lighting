@@ -10,9 +10,15 @@ ANNOTATIONS_DIR = DATA_DIR / "annotations"
 EXPORTS_DIR     = DATA_DIR / "exports"
 MODELS_DIR      = ROOT / "ml" / "models"
 CONCEPTS_DIR    = ROOT / "data" / "concepts"
+DB_PATH         = DATA_DIR / "jobs.db"
 
 for _d in [DWG_DIR, ANNOTATIONS_DIR, EXPORTS_DIR, MODELS_DIR, CONCEPTS_DIR]:
     _d.mkdir(parents=True, exist_ok=True)
+
+# ODA File Converter — free tool to convert binary .dwg → .dxf
+# Download: https://www.opendesign.com/guestfiles/oda_file_converter
+# Set ODA_CONVERTER_PATH env var or install at one of the default locations below.
+ODA_CONVERTER_PATH = os.getenv("ODA_CONVERTER_PATH", "")
 
 DEFAULT_LAYER_MAP = {
     "walls":      ["WALLS","A-WALL","WAND","0"],

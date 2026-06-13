@@ -33,11 +33,15 @@ class ClassifiedPlan:
 
 
 def _rule_classify(area_m2,n_shelf,n_check,aspect):
+    # Furniture-informed rules (PDF input where block names are recognised)
     if area_m2>400 and n_shelf>50: return 'sales_floor',0.88
     if area_m2>100 and n_shelf>10: return 'sales_floor',0.80
-    if n_check>2 and area_m2<100:  return 'checkout_zone',0.85
+    if n_check>2  and area_m2<100: return 'checkout_zone',0.85
+    # Area-only fallback (DWG input: furniture block names often unrecognised)
+    if area_m2>300:                return 'sales_floor',0.65
+    if area_m2>80 and n_shelf>=1:  return 'sales_floor',0.58
     if area_m2>50 and n_shelf<3 and n_check<1: return 'storage',0.60
-    if aspect>5 and area_m2<60:    return 'corridor',0.75
+    if aspect>5  and area_m2<60:   return 'corridor',0.75
     if area_m2<10:                 return 'entrance',0.55
     return 'unknown',0.40
 

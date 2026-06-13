@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>LightingAI.Plugin</AssemblyName>
+    <RootNamespace>LightingAI</RootNamespace>
+    <OutputType>Library</OutputType>
+    <Nullable>enable</Nullable>
+    <LangVersion>10</LangVersion>
+    <PlatformTarget>x64</PlatformTarget>
+    <Optimize>true</Optimize>
+    <!-- AutoCAD installation dir — override with /p:AcadDir="..." on the CLI -->
+    <AcadDir Condition="'$(AcadDir)' == ''">C:\Program Files\Autodesk\AutoCAD 2024</AcadDir>
+    <!-- After build: copy the DLL into the bundle's Contents folder -->
+    <PostBuildEvent>
+      if not exist "$(ProjectDir)bundle\Contents\" mkdir "$(ProjectDir)bundle\Contents\"
+      copy /Y "$(TargetPath)" "$(ProjectDir)bundle\Contents\$(TargetFileName)"
+      copy /Y "$(TargetDir)Newtonsoft.Json.dll" "$(ProjectDir)bundle\Contents\Newtonsoft.Json.dll"
+    </PostBuildEvent>
+  </PropertyGroup>
+
+  <!-- AutoCAD managed assemblies — present at runtime, never copied locally -->
+  <ItemGroup>
+    <Reference Include="acmgd">
+      <HintPath>$(AcadDir)\acmgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="acdbmgd">
+      <HintPath>$(AcadDir)\acdbmgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="AcCoreMgd">
+      <HintPath>$(AcadDir)\AcCoreMgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Ribbon UI — lives in AdWindows.dll -->
+    <Reference Include="AdWindows">
+      <HintPath>$(AcadDir)\AdWindows.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Third-party NuGet packages — these DO get copied to output -->
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+</Project>
