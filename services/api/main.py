@@ -137,6 +137,26 @@ def _run_pipeline(job_id: str, plan_path: Path,
              "area_m2": round(z.area_m2, 2), "bounds": list(z.polygon.bounds)}
             for z in classified.zones
         ]
+        zone_reports_data = [
+            {
+                "zone_type":          r.zone_type,
+                "area_m2":            r.area_m2,
+                "room_width_m":       r.room_width_m,
+                "room_depth_m":       r.room_depth_m,
+                "ceiling_height_m":   r.ceiling_height_m,
+                "room_index_k":       r.room_index_k,
+                "utilisation_factor": r.utilisation_factor,
+                "target_lux":         r.target_lux,
+                "required_count":     r.required_count,
+                "placed_count":       r.placed_count,
+                "grid_pitch_mm":      r.grid_pitch_mm,
+                "maintained_lux":     round(r.maintained_lux_actual(), 1),
+                "luminaire_type":     r.luminaire_type,
+                "luminaire_flux_lm":  r.luminaire_flux_lm,
+                "target_met":         r.maintained_lux_actual() >= r.target_lux * 0.80,
+            }
+            for r in result.zone_reports
+        ]
 
         db.update_job(job_id, "done", "Pipeline complete", result={
             "summary":          result.summary(),
@@ -148,6 +168,7 @@ def _run_pipeline(job_id: str, plan_path: Path,
             "type_D":           len(result.by_type("D")),
             "type_E":           len(result.by_type("E")),
             "zones":            zones_data,
+            "zone_reports":     zone_reports_data,
             "placed":           placed_data,
             "exports": {
                 "dxf":  str(dwg_out),

@@ -365,10 +365,15 @@ class DWGParser:
                 else:
                     zt = _zone_from_label(text_stripped)
                     if zt != 'unknown':
+                        import re as _re
+                        _am = _re.search(
+                            r'([\d]+[,.][\d]+)\s*(?:qm|m²|m2)',
+                            text_stripped, _re.IGNORECASE)
+                        a_m2 = float(_am.group(1).replace(',', '.')) if _am else None
                         plan.zone_labels.append({
                             'text': text_stripped[:80],
                             'zone_type': zt,
-                            'area_m2': None,
+                            'area_m2': a_m2,
                             'x_mm': pos[0],
                             'y_mm': pos[1],
                         })
@@ -402,8 +407,15 @@ class DWGParser:
     @staticmethod
     def _clean_polygons(raw: list[Polygon]) -> list[Polygon]:
         """
-        Remove duplicates, nested small polygons, and invalid geometry.
-        Keeps the largest enclosing polygon when one fully contains another.
+        Remove near-duplicate and invalid geometry.
+
+        A polygon is dropped only if it is nearly the SAME SIZE as a larger
+        polygon that already contains it (poly.area / big.area > 0.85).
+        This preserves separate inner room polygons — they are much smaller
+        than the building envelope and must NOT be dropped.
+
+        Old code had the ratio inverted (big/poly > 0.95), which was always
+        True for any contained polygon and silently erased all inner rooms.
         """
         valid = [p for p in raw if p.is_valid and p.area > 1_000]
         valid.sort(key=lambda p: p.area, reverse=True)
@@ -412,7 +424,8 @@ class DWGParser:
         for poly in valid:
             dominated = False
             for big in kept:
-                if big.contains(poly) and big.area / poly.area > 0.95:
+                # Only drop near-duplicates: same size AND one inside the other
+                if big.contains(poly) and poly.area / big.area > 0.85:
                     dominated = True
                     break
             if not dominated:

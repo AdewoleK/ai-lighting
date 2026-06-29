@@ -22,7 +22,7 @@ from jinja2 import Template
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from config import EXPORTS_DIR
-from services.placer.real_placer import PlacementResult, PlacedLuminaire
+from services.placer.real_placer import PlacementResult, PlacedLuminaire, ZoneLightingReport
 from services.classifier.room_classifier_real import ClassifiedPlan
 
 # ── DXF layer / colour constants ─────────────────────────────────────────────
@@ -34,17 +34,19 @@ TITLE_LAYER = "TITLEBLOCK"
 LEGEND_LAYER= "LEGEND"
 ANNO_LAYER  = "ANNOTATIONS"
 
-COLOR_A    = 6   # magenta
-COLOR_B    = 1   # red
-COLOR_C    = 4   # cyan  (accent)
-COLOR_D    = 2   # yellow (IP44)
-COLOR_E    = 5   # blue  (Sonder)
-COLOR_ZONE = 3   # green
-COLOR_GRID = 8   # dark grey
-COLOR_DIM  = 7   # white/black
+COLOR_A    = 6   # magenta    — K1 shelf inner
+COLOR_B    = 1   # red        — K4 supplement wide-angle
+COLOR_C    = 4   # cyan       — K3 shelf edge / perimeter
+COLOR_D    = 2   # yellow     — K2 checkout / service strong
+COLOR_E    = 5   # blue       — K6 NEO85-SX window track
+COLOR_W    = 3   # green      — honeycomb anti-glare cosmetics
+COLOR_P    = 30  # orange     — K5 Plakate poster accent
+COLOR_ZONE = 140 # light blue — zone outlines
+COLOR_GRID = 8   # dark grey  — ceiling grid
+COLOR_DIM  = 7   # white/black — dimensions
 
 LUMI_COLORS = {'A': COLOR_A, 'B': COLOR_B, 'C': COLOR_C,
-               'D': COLOR_D, 'E': COLOR_E}
+               'D': COLOR_D, 'E': COLOR_E, 'W': COLOR_W, 'P': COLOR_P}
 
 CUTOUT_MM   = 128   # DA (visible cutout diameter)
 OUTER_MM    = 140   # AD (outer diameter)
@@ -89,11 +91,37 @@ def _ensure_lumi_block(doc, lumi_type: str, product_code: str,
     blk = doc.blocks.new(name=safe)
     r   = cutout_mm / 2
 
-    # Geometry
-    blk.add_circle((0,0), r,         dxfattribs={"layer":"0","color":color})
-    blk.add_circle((0,0), r * 0.35,  dxfattribs={"layer":"0","color":color})
-    blk.add_line((-r*.5,0),(r*.5,0), dxfattribs={"layer":"0","color":color})
-    blk.add_line((0,-r*.5),(0,r*.5), dxfattribs={"layer":"0","color":color})
+    # Type-specific geometry
+    if lumi_type == 'A':
+        # Circle + inner circle + orthogonal crosshair
+        blk.add_circle((0,0), r,               dxfattribs={"layer":"0","color":color})
+        blk.add_circle((0,0), r * 0.30,        dxfattribs={"layer":"0","color":color})
+        blk.add_line((-r*.6,0),(r*.6,0),       dxfattribs={"layer":"0","color":color})
+        blk.add_line((0,-r*.6),(0,r*.6),       dxfattribs={"layer":"0","color":color})
+    elif lumi_type == 'B':
+        # Square + center dot
+        blk.add_lwpolyline([(-r,-r),(r,-r),(r,r),(-r,r)], close=True,
+                           dxfattribs={"layer":"0","color":color})
+        blk.add_circle((0,0), r * 0.20,        dxfattribs={"layer":"0","color":color})
+    elif lumi_type == 'C':
+        # Diamond + center dot
+        blk.add_lwpolyline([(0,-r),(r,0),(0,r),(-r,0)], close=True,
+                           dxfattribs={"layer":"0","color":color})
+        blk.add_circle((0,0), r * 0.20,        dxfattribs={"layer":"0","color":color})
+    elif lumi_type == 'D':
+        # Equilateral triangle pointing down + center dot
+        blk.add_lwpolyline([(-r*0.866, r*0.5),(r*0.866, r*0.5),(0,-r)], close=True,
+                           dxfattribs={"layer":"0","color":color})
+        blk.add_circle((0,0), r * 0.20,        dxfattribs={"layer":"0","color":color})
+    elif lumi_type == 'E':
+        # Circle + diagonal X cross (distinct from A's orthogonal +)
+        blk.add_circle((0,0), r,               dxfattribs={"layer":"0","color":color})
+        blk.add_line((-r*.6,-r*.6),(r*.6,r*.6),dxfattribs={"layer":"0","color":color})
+        blk.add_line((-r*.6,r*.6),(r*.6,-r*.6),dxfattribs={"layer":"0","color":color})
+    else:
+        # Fallback: double circle
+        blk.add_circle((0,0), r,               dxfattribs={"layer":"0","color":color})
+        blk.add_circle((0,0), r * 0.35,        dxfattribs={"layer":"0","color":color})
 
     # ATTDEFs (invisible — carried in block for BOM extraction)
     attribs_base = {"layer":"0","height":r*0.4,"flags":ezdxf.const.ATTRIB_INVISIBLE}
@@ -195,7 +223,7 @@ def _draw_legend(msp, x0: float, y0: float, result: PlacementResult):
                          p.wattage, int(p.beam_angle_deg),
                          type_cnt[t]))
 
-    ROW_H = 8_000   # height per row in mm-units
+    ROW_H = 16_000   # height per row in mm-units — 2× so icons are visually large
     W     = 120_000
     PAD   = 2_000
     TH    = 2_200
@@ -223,29 +251,55 @@ def _draw_legend(msp, x0: float, y0: float, result: PlacementResult):
          (x0+PAD, cut_y+PAD), LH, LEGEND_LAYER, color=8)
 
     # Rows
-    col_sym  = x0 + 5_000
-    col_code = x0 + 18_000
+    # r_leg scaled so symbols match the visual weight of the text.
+    # 0.44 × ROW_H = 3520 at ROW_H=8000.  Also use lineweight 50 (0.50 mm) on
+    # every symbol entity so the outline is as bold as the filled text beside it.
+    r_leg    = int(ROW_H * 0.44)   # 7 040 at ROW_H=16 000 — big, visible icons
+    col_sym  = x0 + PAD
+    col_code = x0 + r_leg*2 + PAD*4
     col_qty  = x0 + W - 20_000
 
     for i, (ltype, pcode, desc, watt, beam, qty) in enumerate(ROWS):
         ry  = y0 + H - ROW_H*(i+3) + PAD
         clr = LUMI_COLORS.get(ltype, 7)
-        r   = CUTOUT_MM / 2
+        r   = r_leg   # use display radius throughout this row
 
-        # Mini symbol
+        # Mini symbol — type-specific geometry, thick pen so outlines match text weight
         cx = col_sym + r
-        msp.add_circle((cx, ry+r), r,
-                       dxfattribs={"layer": LEGEND_LAYER, "color": clr})
-        msp.add_circle((cx, ry+r), r*0.35,
-                       dxfattribs={"layer": LEGEND_LAYER, "color": clr})
+        cy = ry + r
+        la = {"layer": LEGEND_LAYER, "color": clr, "lineweight": 50}
+        if ltype == 'A':
+            msp.add_circle((cx,cy), r,             dxfattribs=la)
+            msp.add_circle((cx,cy), r*0.30,        dxfattribs=la)
+            msp.add_line((cx-r*.6,cy),(cx+r*.6,cy),dxfattribs=la)
+            msp.add_line((cx,cy-r*.6),(cx,cy+r*.6),dxfattribs=la)
+        elif ltype == 'B':
+            msp.add_lwpolyline([(cx-r,cy-r),(cx+r,cy-r),(cx+r,cy+r),(cx-r,cy+r)],
+                               close=True, dxfattribs=la)
+            msp.add_circle((cx,cy), r*0.20,        dxfattribs=la)
+        elif ltype == 'C':
+            msp.add_lwpolyline([(cx,cy-r),(cx+r,cy),(cx,cy+r),(cx-r,cy)],
+                               close=True, dxfattribs=la)
+            msp.add_circle((cx,cy), r*0.20,        dxfattribs=la)
+        elif ltype == 'D':
+            msp.add_lwpolyline([(cx-r*0.866,cy+r*0.5),(cx+r*0.866,cy+r*0.5),(cx,cy-r)],
+                               close=True, dxfattribs=la)
+            msp.add_circle((cx,cy), r*0.20,        dxfattribs=la)
+        elif ltype == 'E':
+            msp.add_circle((cx,cy), r,             dxfattribs=la)
+            msp.add_line((cx-r*.6,cy-r*.6),(cx+r*.6,cy+r*.6),dxfattribs=la)
+            msp.add_line((cx-r*.6,cy+r*.6),(cx+r*.6,cy-r*.6),dxfattribs=la)
+        else:
+            msp.add_circle((cx,cy), r,             dxfattribs=la)
+            msp.add_circle((cx,cy), r*0.35,        dxfattribs=la)
 
-        # Type letter
-        _txt(msp, ltype, (cx-LH*0.4, ry+r*2+PAD), LH, LEGEND_LAYER, color=clr)
+        # Type letter — floated above the symbol centre so it doesn't overlap text columns
+        _txt(msp, ltype, (cx-TH*0.25, cy+r*0.55), TH*0.85, LEGEND_LAYER, color=clr)
 
-        # Product code + description
+        # Product code + description — col_code already accounts for large symbol
         _txt(msp, f"{pcode}",           (col_code, ry+r+TH*0.2), LH*0.85, LEGEND_LAYER)
         _txt(msp, f"{desc}  {watt}W  {beam}°",
-             (col_code, ry+r-LH), LH*0.8, LEGEND_LAYER, color=8)
+             (col_code, ry+r-LH*1.2), LH*0.8, LEGEND_LAYER, color=8)
 
         # Quantity
         _txt(msp, f"× {qty}", (col_qty, ry+r), TH, LEGEND_LAYER, color=clr)
@@ -253,6 +307,44 @@ def _draw_legend(msp, x0: float, y0: float, result: PlacementResult):
         # Row divider
         msp.add_line((x0, ry-PAD), (x0+W, ry-PAD),
                      dxfattribs={"layer": LEGEND_LAYER, "color": 8})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ceiling tile grid (tile boundary lines — lights sit at cell centres)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _draw_ceiling_grid(msp, classified: "ClassifiedPlan",
+                       pitch_mm: float = 1250.0) -> None:
+    """
+    Draw ceiling tile boundary lines on CEILING-GRID layer.
+
+    Grid lines are drawn at light_origin ± pitch/2 so that each luminaire
+    position sits at the CENTER of its 1250×1250 mm ceiling module, matching
+    the MAX FRANKE.led professional Deckenrasterplan layout.
+    """
+    sf_z = next((z for z in classified.zones if z.zone_type == 'sales_floor'), None)
+    if sf_z is None:
+        return
+    b   = sf_z.polygon.bounds          # (xmin, ymin, xmax, ymax)
+    ox  = b[0] + 1000.0                # Startmaß: light origin X
+    oy  = b[1] + 2000.0                # Startmaß: light origin Y
+    half = pitch_mm * 0.5              # 625mm — offset to tile boundary
+
+    _grid_attr = {"layer": GRID_LAYER, "color": COLOR_GRID, "lineweight": 50}
+
+    # Draw vertical lines (constant X) from ymin..ymax
+    x = ox - half
+    while x <= b[2] + half:
+        if x >= b[0] - half:
+            msp.add_line((x, b[1]), (x, b[3]), dxfattribs=_grid_attr)
+        x += pitch_mm
+
+    # Draw horizontal lines (constant Y) from xmin..xmax
+    y = oy - half
+    while y <= b[3] + half:
+        if y >= b[1] - half:
+            msp.add_line((b[0], y), (b[2], y), dxfattribs=_grid_attr)
+        y += pitch_mm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -342,7 +434,7 @@ def export_dwg(result: PlacementResult, classified: ClassifiedPlan,
     for name, color, lw in [
         (LUMI_LAYER,   COLOR_A, 35),
         (ZONE_LAYER,   COLOR_ZONE, 18),
-        (GRID_LAYER,   COLOR_GRID, 13),
+        (GRID_LAYER,   COLOR_GRID, 50),
         (DIM_LAYER,    COLOR_DIM, 18),
         (TITLE_LAYER,  7, 25),
         (LEGEND_LAYER, 7, 18),
@@ -379,6 +471,9 @@ def export_dwg(result: PlacementResult, classified: ClassifiedPlan,
         # Attach ATTRIB values to the INSERT
         ref.add_attrib("TYPE",    lp.lumi_type,    insert=(lp.x, lp.y + lp.cutout_mm))
         ref.add_attrib("PRODUCT", lp.product_code, insert=(lp.x, lp.y - lp.cutout_mm))
+
+    # ── Ceiling tile grid (tile boundaries — lights at cell centres) ──────
+    _draw_ceiling_grid(msp, classified)
 
     # ── Dimension annotations ──────────────────────────────────────────────
     _draw_dimensions(msp, result)
@@ -461,17 +556,22 @@ def export_excel(result: PlacementResult, classified: ClassifiedPlan,
     ws['A4'].font = Font(size=9, color="888888", name="Calibri", italic=True)
 
     summary_rows = [
-        ("Total luminaires",    len(result.placed)),
-        ("Type A (15W 40°)",    len(result.by_type("A"))),
-        ("Type B (20W 60°)",    len(result.by_type("B"))),
-        ("Type C (accent)",     len(result.by_type("C"))),
-        ("Type D (IP44)",       len(result.by_type("D"))),
-        ("Type E (special)",    len(result.by_type("E"))),
-        ("Total load",          f"{result.total_wattage():.0f} W"),
-        ("Zones classified",    len(classified.zones)),
-        ("Grid pitch",          "1250 mm"),
-        ("Ceiling height",      "3000 mm"),
-        ("Product family",      "MIKA80-E (MAX FRANKE.led)"),
+        ("Total luminaires",               len(result.placed)),
+        ("A — K1 Regalbeleuchtung 15W 40°", len(result.by_type("A"))),
+        ("B — K4 Ergänzung 20W 60°",        len(result.by_type("B"))),
+        ("C — K3 Rand 15W 40°",             len(result.by_type("C"))),
+        ("D — K2 Checkout/Service 20W 40°", len(result.by_type("D"))),
+        ("E — K6 Schaufenster 20W 60°",     len(result.by_type("E"))),
+        ("W — Wabeneinsatz 20W 36°",        len(result.by_type("W"))),
+        ("P — K5 Plakate 16W 24°",          len(result.by_type("P"))),
+        ("Total connected load",            f"{result.total_wattage():.0f} W"),
+        ("W/m² density",                    f"{result.total_wattage()/max(sum(z.area_m2 for z in classified.zones),1):.2f} W/m²"),
+        ("Zones classified",                len(classified.zones)),
+        ("Grid pitch (Startmaß)",           "1250 mm"),
+        ("Ceiling height (UK Rasterdecke)", "3000 mm"),
+        ("Product family",                  "MIKA80-E + NEO85-SX (MAX FRANKE.led)"),
+        ("Standard",                        "EN 12464-1 Lichtstrommethode"),
+        ("Maintenance factor MF",           "0.80"),
     ]
     for i, (lbl, val) in enumerate(summary_rows, start=6):
         ws.cell(row=i, column=1, value=lbl).font = Font(bold=True, size=10, name="Calibri")
@@ -532,6 +632,62 @@ def export_excel(result: PlacementResult, classified: ClassifiedPlan,
             _dc(ws3, idx+1, col, v, alt=alt,
                 align=LC if col in (2,4,5,11) else CC)
 
+    # ── Beleuchtungsberechnung (EN 12464-1 lighting calculation) ─────────────
+    if result.zone_reports:
+        ws4 = wb.create_sheet("Beleuchtungsberechnung"); ws4.freeze_panes = "A3"
+        ws4.sheet_view.showGridLines = False
+        ws4.column_dimensions['A'].width = 18
+
+        # Title row
+        t = ws4.cell(row=1, column=1, value="Beleuchtungsberechnung — EN 12464-1 Lichtstrommethode")
+        t.font = TF; t.alignment = LC
+
+        lh2 = [
+            ("Zone",           16), ("Fläche m²",   10), ("Breite m",    9),
+            ("Tiefe m",         9), ("Raumhöhe m",  10), ("Raumindex k",  10),
+            ("Nutzungsgrad η",  12), ("Ziel-Em Lux", 12), ("n berechnet",  11),
+            ("n platziert",    11), ("Raster mm",   10), ("Em erreicht",  11),
+            ("Status",          8),
+        ]
+        for col, (h, w) in enumerate(lh2, 1):
+            _hc(ws4, 2, col, h, w)
+        ws4.row_dimensions[2].height = 30
+
+        for row_i, rpt in enumerate(result.zone_reports, start=3):
+            em_actual = rpt.maintained_lux_actual()
+            ok        = "✓" if em_actual >= rpt.target_lux * 0.80 else "!"
+            alt       = (row_i % 2 == 0)
+            vals = [
+                rpt.zone_type.replace('_', ' ').title(),
+                round(rpt.area_m2, 1),
+                rpt.room_width_m,
+                rpt.room_depth_m,
+                rpt.ceiling_height_m,
+                round(rpt.room_index_k, 2),
+                round(rpt.utilisation_factor, 3),
+                rpt.target_lux,
+                rpt.required_count,
+                rpt.placed_count,
+                rpt.grid_pitch_mm,
+                round(em_actual, 0),
+                ok,
+            ]
+            for col, v in enumerate(vals, 1):
+                align = LC if col == 1 else CC
+                c = ws4.cell(row=row_i, column=col, value=v)
+                c.font = BF; c.alignment = align; c.border = CB
+                if alt: c.fill = ALT
+                # Colour-code status cell
+                if col == 13:
+                    c.font = Font(bold=True, size=9, name="Calibri",
+                                  color="00AA00" if ok == "✓" else "CC0000")
+
+        # Footer note
+        note_row = 3 + len(result.zone_reports) + 1
+        n = ws4.cell(row=note_row, column=1,
+                     value="Wartungsfaktor MF = 0.80 (vierteljährl. Reinigung, LED) · Arbeitsebenenhöhe 850 mm")
+        n.font = Font(size=8, italic=True, color="666666", name="Calibri")
+
     if output_path is None:
         output_path = str(EXPORTS_DIR /
                           f"{Path(result.source_file).stem}_fixture_schedule.xlsx")
@@ -569,6 +725,10 @@ tr:nth-child(even) td{background:#f4f7fd}
 .badge-a{background:#e040fb22;color:#e040fb}
 .badge-b{background:#f4433622;color:#f44336}
 .badge-c{background:#00bcd422;color:#00bcd4}
+.badge-d{background:#ffeb3b22;color:#f9a825}
+.badge-e{background:#2196f322;color:#1565c0}
+.badge-w{background:#4caf5022;color:#2e7d32}
+.badge-p{background:#ff980022;color:#e65100}
 @page{size:A4;margin:0}
 </style></head><body>
 <div class="cov">
@@ -584,7 +744,11 @@ tr:nth-child(even) td{background:#f4f7fd}
     <span class="badge badge-a">{{ ta }}×A</span>
     <span class="badge badge-b">{{ tb }}×B</span>
     {% if tc %}<span class="badge badge-c">{{ tc }}×C</span>{% endif %}
-  </div><div class="l">Type split (A=15W 40° / B=20W 60° / C=accent)</div></div>
+    {% if td %}<span class="badge badge-d">{{ td }}×D</span>{% endif %}
+    {% if te %}<span class="badge badge-e">{{ te }}×E</span>{% endif %}
+    {% if tw_type %}<span class="badge badge-w">{{ tw_type }}×W</span>{% endif %}
+    {% if tp %}<span class="badge badge-p">{{ tp }}×P</span>{% endif %}
+  </div><div class="l">A=K1 15W 40° / B=K4 20W 60° / C=K3 Rand / D=K2 Checkout / E=K6 Track / W=Wabe / P=Plakate</div></div>
   <div class="st"><div class="v">{{ zones }}</div><div class="l">Zones classified</div></div>
 </div></div>
 <div class="sec"><h2>Zone Summary</h2><table>
@@ -647,18 +811,26 @@ def export_pdf(result: PlacementResult, classified: ClassifiedPlan,
           for z in classified.zones]
 
     specs = [
-        ("Grid pitch",        "1250 mm"),
-        ("Ceiling height",    "3000 mm / Fries 3300 mm"),
-        ("Luminaire family",  "MIKA80-E (MAX FRANKE.led)"),
-        ("Cutout dia. (DA)",  "128 mm"),
-        ("Outer dia. (AD)",   "140 mm"),
-        ("Embed depth (EBT)", "110 mm"),
-        ("CCT",               "3000 K"),
-        ("CRI",               ">90"),
-        ("Dimmable",          "Yes (DV2.5)"),
-        ("IP (standard)",     "IP20"),
-        ("IP (entrance/WC)",  "IP44"),
-        ("Tilt/Rotate",       "35° / 355°"),
+        ("Grid pitch (Startmaß Rasterdecke)", "1250 mm"),
+        ("Ceiling height (UK Rasterdecke)",   "3000 mm / Fries 3300 mm"),
+        ("A — K1 Regalbeleuchtung Innenraum", "MIKA80-E 15W 40° 2400lm"),
+        ("B — K4 Ergänzungsbeleuchtung",       "MIKA80-E 20W 60° 3200lm"),
+        ("C — K3 Regalbeleuchtung Rand",       "MIKA80-E 15W 40° 2400lm"),
+        ("D — K2 Checkout / Service",          "MIKA80-E 20W 40° 3200lm"),
+        ("E — K6 Schaufenster",                "NEO85-SX 20W 60° 3200lm Track"),
+        ("W — Wabeneinsatz Cosmetics",         "MIKA80-E 20W 36° 1700lm Honeycomb"),
+        ("P — K5 Plakate Poster",              "MIKA80-E 16W 24° 2100lm Power-Linse"),
+        ("Cutout dia. (DA)",                   "128 mm  /  NEO85-SX: 85 mm"),
+        ("Outer dia. (AD)",                    "140 mm  /  NEO85-SX: 85 mm"),
+        ("Embed depth (EBT)",                  "110 mm  /  NEO85-SX: 146 mm"),
+        ("CCT",                                "3000 K"),
+        ("CRI",                                ">90"),
+        ("Dimmable",                           "Yes (DV2.5)"),
+        ("IP rating (all)",                    "IP20"),
+        ("Tilt / Rotate",                      "35° / 355°"),
+        ("Maintenance factor MF",              "0.80  (CIE 97, quarterly cleaning, LED)"),
+        ("Work plane",                         "850 mm  (EN 12464-1)"),
+        ("No-lighting zones",                  "Windfang, Rolltreppe, Aufzug, WC, Technik"),
     ]
     html = Template(_TPL).render(
         project_name=project_name, concept_id=concept_id, customer=customer,
@@ -668,6 +840,10 @@ def export_pdf(result: PlacementResult, classified: ClassifiedPlan,
         ta=len(result.by_type("A")),
         tb=len(result.by_type("B")),
         tc=len(result.by_type("C")),
+        td=len(result.by_type("D")),
+        te=len(result.by_type("E")),
+        tw_type=len(result.by_type("W")),
+        tp=len(result.by_type("P")),
         zones=len(classified.zones),
         br=br, zr=zr, specs=specs,
     )

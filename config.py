@@ -21,16 +21,20 @@ for _d in [DWG_DIR, ANNOTATIONS_DIR, EXPORTS_DIR, MODELS_DIR, CONCEPTS_DIR]:
 ODA_CONVERTER_PATH = os.getenv("ODA_CONVERTER_PATH", "")
 
 DEFAULT_LAYER_MAP = {
-    "walls":      ["WALLS","A-WALL","WAND","0"],
-    "ceiling":    ["CEILING","A-CLNG","DECKE","RASTERDECKE"],
-    "grid":       ["GRID","CEILING-GRID","RASTER","A-CLNG-GRID","DECKENRASTER"],
+    # Standard CAD names + Rossmann/German project layer names
+    "walls":      ["WALLS","A-WALL","WAND","0",
+                   "01_Grundriss","15_Kontur_drüber","01_Möbel_Nebenräume"],
+    "ceiling":    ["CEILING","A-CLNG","DECKE","RASTERDECKE","08_TGA"],
+    "grid":       ["GRID","CEILING-GRID","RASTER","A-CLNG-GRID","DECKENRASTER","01_Höhen"],
     "doors":      ["DOORS","A-DOOR","TUR","TUER"],
     "windows":    ["WINDOWS","A-GLAZ","FENSTER"],
-    "furniture":  ["FURNITURE","A-FURN","EINRICHTUNG"],
-    "shelving":   ["SHELVING","REGAL","GONDOLA","BEELINE","SLATWALL"],
+    "furniture":  ["FURNITURE","A-FURN","EINRICHTUNG",
+                   "10_Einrichtung","13_Ladenbau","12_Deko"],
+    "shelving":   ["SHELVING","REGAL","GONDOLA","BEELINE","SLATWALL","20_Sortimentierung"],
     "checkout":   ["CHECKOUT","KASSE","SB","KASSENSTUHL"],
     "luminaires": ["LUMINAIRES","LEUCHTE","BELEUCHTUNG","E-LITE"],
-    "annotations":["TEXT","ANNO","A-ANNO"],
+    "annotations":["TEXT","ANNO","A-ANNO",
+                   "TXT Schrift allgemein","01_Text","01_Raumstempel"],
 }
 
 ZONE_TYPES = ["sales_floor","checkout_zone","entrance","storage",

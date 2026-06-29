@@ -126,12 +126,31 @@ def _pt2mm(pts: float, scale: int) -> float:
     return pts * (25.4 / 72.0) * scale
 
 LABEL_MAP = {
+    # Sales / retail
     'verkaufsraum':'sales_floor','verkauf':'sales_floor','vkf':'sales_floor',
-    'lager':'storage','windfang':'entrance','eingang':'entrance',
-    'technik':'service_area','wc':'service_area','flur':'corridor',
-    'zbv':'storage','kasse':'checkout_zone','kassen':'checkout_zone',
-    'rolltreppe':'corridor','aufzug':'corridor',
-    'nasszelle':'service_area','büro':'office',
+    # Storage
+    'lager':'storage','zbv':'storage','lagerraum':'storage',
+    # Checkout
+    'kasse':'checkout_zone','kassen':'checkout_zone','sb-kasse':'checkout_zone',
+    # Circulation
+    'flur':'corridor','eingang':'entrance','treppenraum':'corridor',
+    # Display window — NEO85-SX track spotlights
+    'schaufenster':'display_window',
+    # Service / staff
+    'technik':'technical','büro':'office',
+    'personal':'service_area','teeküche':'service_area',
+    'putzmittel':'technical','serverraum':'technical',
+    # Wet rooms (different IP fixtures, not in scope)
+    'wc':'wc','nasszelle':'wc','umkleide':'wc',
+    # ── NO-LIGHTING zones ──────────────────────────────────────────────────
+    # The plans explicitly annotate: "Direkte Beleuchtung nicht möglich"
+    'windfang':'windfang',         # entrance vestibule — NO LIGHTING
+    'sauberlaufzone':'windfang',   # dirt-trap mat zone at entrance — NO LIGHTING
+    'rolltreppe':'escalator',      # escalator — structural exclusion
+    'aufzug':'elevator',           # elevator — has own integrated lighting
+    'fahrkorb':'elevator',         # lift car
+    'treppenhaus':'escalator',     # stairwell
+    'schacht':'elevator',          # shaft
 }
 SHELF_LABELS  = {'57','47','77','37','67','27','57/47','47/37','77/57','57/37'}
 CHECKOUT_KWDS = {'kasse','kassenstuhl','lübecker','abweiser'}
