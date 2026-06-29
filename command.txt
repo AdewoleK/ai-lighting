@@ -1,0 +1,94 @@
+Step 1 — Start the API server (Terminal 1, keep open)
+Open a Terminal window. Run:
+
+
+cd /Users/dextercyberlabs/ai-lighting
+source venv/bin/activate
+uvicorn services.api.main:app --host 0.0.0.0 --port 8000 --reload
+
+
+
+Step 2 — Open AutoCAD and load the plugin (one-time per session)
+Open AutoCAD
+Open your DWG floor plan file — File → Open → select your .dwg file
+Load the plugin — in the AutoCAD command line at the bottom, click it and type:
+
+(load "/Users/dextercyberlabs/ai-lighting/autocad-plugin/lisp/LightingAI.lsp")
+Press Enter. You will see the plugin banner appear:
+
+
+[LightingAI] ║   LIGHTING AI — MIKA80-E Rossmann (Mac)
+Shortcut for next time: drag and drop LightingAI.lsp from Finder onto the AutoCAD window instead of typing the load command.
+
+
+
+Step 3 — Mark the grid origin in AutoCAD
+In the AutoCAD command line, type:
+
+
+LIGHTINGAI_SETUP
+Press Enter. AutoCAD will ask you to pick a point.
+
+Turn on OSNAP → Intersection (type OSNAP → tick Intersection)
+Click the corner where the first ceiling grid lines cross (the Startmaß Rasterdecke — the starting point of the suspended ceiling grid)
+Press Enter when asked for the grid pitch (accepts 1250 mm automatically)
+A yellow dot appears at your chosen point. This is the grid origin.
+
+
+
+
+Step 4 — Run the bridge in a second Terminal
+Open a new Terminal window (keep the API server running in Terminal 1). Run:
+
+
+source /Users/dextercyberlabs/ai-lighting/venv/bin/activate
+
+python3 /Users/dextercyberlabs/ai-lighting/autocad-plugin/lisp/lightingai_bridge.py \
+  "/full/path/to/your/floor-plan.dwg"
+Replace /full/path/to/your/floor-plan.dwg with the actual path to your DWG file. For example:
+
+
+python3 /Users/dextercyberlabs/ai-lighting/autocad-plugin/lisp/lightingai_bridge.py \
+  "/Users/dextercyberlabs/Downloads/MyStore_EG.dwg" \
+  --project "My Store Name" \
+  --customer "Dirk Rossmann GmbH"
+You will see the pipeline run:
+
+
+[LightingAI] Backend online.
+  [processing]  Parsing plan…
+  [processing]  Classifying zones…
+  [processing]  Placing luminaires…
+  [processing]  Exporting…
+  [done]
+
+[LightingAI] Pipeline complete:
+  Total luminaires : 224
+  Total wattage    : 4175 W
+  Type A/B/C/D/E   : 61/161/2/0/0
+
+[LightingAI] ✓  All done!
+[LightingAI]    Now go to AutoCAD and type:  LIGHTINGAI_PLACE
+
+
+
+Step 5 — Place the lights in AutoCAD
+Click back in AutoCAD. In the command line, type:
+
+
+LIGHTINGAI_PLACE
+Press Enter. AutoCAD will load and run the LISP commands. After 5–20 seconds you will see:
+
+Luminaire symbols drawn on the floor plan
+A legend panel (Leuchtenlegende)
+A title block (Schriftfeld)
+
+
+
+Step 6 — Save the drawing
+In AutoCAD: File → Save (or Cmd+S)
+
+If you want to redo / start over on the same drawing
+
+LIGHTINGAI_CLEAR
+This erases every AI-placed entity. Your original floor plan is untouched. Then repeat from Step 3.

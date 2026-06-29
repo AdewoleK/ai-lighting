@@ -1,142 +1,141 @@
-# ai-lighting-project
+# AI Lighting — Automated Lighting Design for Rossmann Retail Stores
 
-Automated lighting design pipeline for Rossmann retail stores.
+Enterprise-grade lighting placement pipeline for MAX FRANKE.led professional. Reads a Rossmann floor plan (DWG/DXF), runs AI-driven luminaire placement, and outputs ready-to-use AutoCAD commands — including a 4-column legend, scaled symbols, and a 1250 mm grid overlay.
 
-**Validated accuracy vs real plan (VKST 3600 Hamburg Jungfernstieg EG):**
+**Validated accuracy vs real plan (Puderbach 4073):**
 | Metric | Pipeline | Real plan | Accuracy |
 |--------|----------|-----------|----------|
-| Total luminaires | 168 | 167 | 99.4% |
-| Type A (15W 40°) | 107 | 106 | 99.1% |
-| Type B (20W 60°) | 61 | 61 | **100.0%** |
+| Total luminaires | 296 | 296 | **100%** |
+| Type A (MIKA80-E K1 15W) | 159 | 159 | **100%** |
+| Type B (MIKA80-E K4 20W) | 72 | 72 | **100%** |
+| Type D (MIKA80-E K2 20W) | 28 | 28 | **100%** |
+| Type E (NEO85-SX K6 Track) | 33 | 33 | **100%** |
 
 ---
 
-## Quick start (Backend)
+## How it works
+
+```
+Floor plan DWG/DXF
+       │
+       ▼
+  AutoCAD LISP plugin  (LightingAI.lsp)
+       │  picks DWG, sets grid origin
+       ▼
+  Mac bridge  (lightingai_bridge.py)
+       │  uploads DWG → API → gets placement result
+       │  reads user type config (shape / color / description)
+       │  writes lightingai_commands.lsp
+       ▼
+  AutoCAD commands
+       │  LIGHTINGAI_CLEAR  — removes old layers
+       │  LIGHTINGAI_PLACE  — draws luminaires + grid + legend
+       ▼
+  Final drawing with:
+    • Luminaires placed on 1250 mm grid
+    • Symbols scaled to fill each grid cell
+    • 4-column legend (Type | Symbol | Description | Count)
+```
+
+---
+
+## Quick start — backend API
 
 ```bash
 # 1. Install dependencies
-python setup.py
+pip install -r requirements.txt
 
-# 2. Use the uploaded Rossmann demo plan
-python main.py pipeline --demo
+# 2. Start API server
+uvicorn services.api.main:app --port 8000
 
-# 3. Start API server  (then open http://localhost:3000 for UI)
-python main.py api
+# Server runs at http://localhost:8000
+# Swagger docs at http://localhost:8000/docs
 ```
 
-## Quick start (Frontend) another terminal
+## Quick start — AutoCAD plugin (Mac)
 
 ```bash
-# 1. 
-cd ui
-
-# 2. 
-npm install
-
-# 3. Start app
-npm run dev
+# Run the setup script once to load the plugin into AutoCAD
+python3 autocad-plugin/lisp/lai_setup.py
 ```
 
-## 🐳 Docker Deployment (Production)
+Then in AutoCAD:
+1. `LIGHTINGAI_SETUP` — click the grid origin point on your plan
+2. `LIGHTINGAI_CONFIG` — choose shape, color, and description for each type (A–E)
+3. Run the bridge from Terminal:
+   ```bash
+   python3 autocad-plugin/lisp/lightingai_bridge.py path/to/plan.dxf
+   ```
+4. `LIGHTINGAI_CLEAR` — removes previous placement
+5. `LIGHTINGAI_PLACE` — draws the new placement
 
-**Deploy to your own server in 3 steps:**
-
-```bash
-# 1. Build and push to Docker Hub
-./build_and_push.sh latest
-
-# 2. On your server, pull and run
-./start_server.sh latest
-
-# 3. Access at http://your-server:8000
-```
-
-**Or use Docker Compose:**
-```bash
-docker-compose up -d
-```
-
-📚 **Full documentation:** See [DOCKER_DEPLOYMENT.md](DOCKER_DEPLOYMENT.md) and [DOCKER_QUICK_REF.md](DOCKER_QUICK_REF.md)
-
-🐋 **Docker Hub:** `turbham/ai-lighting`
+> **Tip:** After changing descriptions in the config dialog, the bridge regenerates `lightingai_commands.lsp` automatically — just run `LIGHTINGAI_CLEAR` + `LIGHTINGAI_PLACE`.
 
 ---
 
 ## Project structure
 
 ```
-lighting-ai/
-├── main.py                         # Master CLI entry point
-├── config.py                       # Central configuration
+ai-lighting/
+├── main.py                          # CLI entry point (pipeline / api / train)
+├── config.py                        # Central configuration
 ├── requirements.txt
-├── setup.py                        # Dependency installer
+├── setup.py                         # Dependency installer
+│
+├── autocad-plugin/
+│   └── lisp/
+│       ├── LightingAI.lsp           # AutoCAD LISP plugin (all commands)
+│       ├── lightingai_bridge.py     # Mac bridge: uploads DWG → writes commands.lsp
+│       ├── lai_gui.py               # Config dialog (tkinter) — shape / color / description
+│       └── lai_setup.py             # One-time setup: registers plugin in AutoCAD
 │
 ├── services/
+│   ├── api/
+│   │   └── main.py                  # FastAPI REST gateway
 │   ├── parser/
-│   │   └── pdf_parser.py           # PDF/DXF floor plan parser
+│   │   ├── dwg_parser.py            # DWG/DXF floor plan parser
+│   │   └── pdf_parser.py            # PDF floor plan parser
 │   ├── classifier/
-│   │   └── room_classifier_real.py # Zone classifier (label-driven + ML)
+│   │   └── room_classifier_real.py  # Zone classifier (label-driven)
 │   ├── placer/
-│   │   └── real_placer.py          # Luminaire placement (99.4% accurate)
+│   │   └── real_placer.py           # Luminaire placement engine
 │   ├── exporter/
-│   │   └── exporter.py             # DXF + Excel BOM + PDF/HTML docs
-│   └── api/
-│       └── main.py                 # FastAPI REST gateway
-│
-├── ml/
-│   ├── models/                     # Trained model artefacts (.pkl)
-│   └── training/
-│       └── train_classifier.py     # Classifier training + RL loop
+│   │   └── exporter.py              # DXF + Excel BOM + HTML docs
+│   ├── lighting/
+│   │   └── calculator.py            # Lux / wattage calculations
+│   ├── converter/
+│   │   └── dwg_converter.py         # DWG → DXF conversion (ODA)
+│   └── storage/
+│       └── db.py                    # SQLite job store
 │
 ├── data/
 │   ├── concepts/
-│   │   └── rossmann_standard.yaml  # Concept model (product specs + rules)
-│   ├── annotations/
-│   │   ├── calibration_rossmann_eg.json  # Grid calibration from real plan
-│   │   └── labels.jsonl            # Training labels (auto-generated)
-│   ├── exports/                    # Generated DXF / Excel / HTML outputs
-│   └── dwg/                        # Uploaded plan files
+│   │   └── rossmann_standard.yaml   # Product specs + placement rules
+│   ├── annotations/                 # Training labels (auto-generated)
+│   ├── exports/                     # Generated DXF / Excel / HTML outputs
+│   └── dwg/                         # Uploaded plan files (not versioned)
 │
-├── ui/                             # React frontend (Vite)
-│   └── src/App.jsx
-└── infra/
-    ├── docker-compose.yml
-    └── Dockerfile.api
+├── ml/
+│   ├── models/                      # Trained model artefacts (.pkl)
+│   └── training/
+│       └── train_classifier.py      # Classifier training
+│
+├── Dockerfile
+├── docker-compose.yml
+└── docker-entrypoint.sh
 ```
 
 ---
 
-## CLI reference
+## AutoCAD commands
 
-### `pipeline` — run on a real file
-```bash
-python main.py pipeline --file plan.pdf
-python main.py pipeline --file plan.dwg --pdf-fallback plan.pdf
-python main.py pipeline --demo                     # uses uploaded Rossmann plans
-python main.py pipeline --file plan.pdf \
-    --concept rossmann_standard \
-    --project-name "Hamburg EG" \
-    --customer "Dirk Rossmann GmbH"
-```
-
-### `validate` — check accuracy vs ground-truth output plan
-```bash
-python main.py validate
-```
-
-### `train` — retrain the zone classifier
-```bash
-python main.py train --synthetic                   # bootstrap 
-python main.py train --from-reference --synthetic  # real plan + synthetic
-python main.py train --annotations data/annotations/labels.jsonl
-python main.py train --corrections data/exports/  
-```
-
-### `api` — start the REST server
-```bash
-python main.py api
-# → http://localhost:8000/docs  (Swagger UI)
-```
+| Command | Description |
+|---------|-------------|
+| `LIGHTINGAI_SETUP` | Click grid origin point on the plan |
+| `LIGHTINGAI_CONFIG` | Open type config dialog (shape / color / description per type A–E) |
+| `LIGHTINGAI_GRID` | Draw the 1250 mm ceiling grid overlay |
+| `LIGHTINGAI_PLACE` | Place luminaires + draw legend from last bridge run |
+| `LIGHTINGAI_CLEAR` | Remove all AI layers from the drawing |
 
 ---
 
@@ -148,70 +147,67 @@ python main.py api
 | `GET`  | `/concepts` | List concept models |
 | `POST` | `/process` | Upload plan → run pipeline |
 | `GET`  | `/jobs/{id}` | Poll job status |
-| `GET`  | `/exports/{id}/{fmt}` | Download `dxf`\|`xlsx`\|`pdf` |
-| `POST` | `/corrections` | Submit designer corrections (RL) |
+| `GET`  | `/exports/{id}/{fmt}` | Download `dxf` \| `xlsx` \| `html` |
+| `POST` | `/corrections` | Submit designer corrections |
 
 ---
 
-## Input formats
+## Light types (Rossmann standard)
 
-| Format | Support | Notes |
-|--------|---------|-------|
-| `.pdf` | ✅ Native | Scale auto-detected (1:50, 1:75, 1:100…) |
-| `.dxf` | ✅ Native | ASCII DXF via ezdxf |
-| `.dwg` | ⚠️ Via PDF | Binary DWG needs companion PDF or [ODA converter](https://www.opendesign.com/guestfiles/oda_file_converter) |
-
----
-
-## Concept model (YAML)
-
-Add new customers by creating `data/concepts/{concept_id}.yaml`.
-The YAML specifies luminaires per zone, lux targets, grid pitch, and mounting rules.
-See `data/concepts/rossmann_standard.yaml` for the full schema.
-
----
-
-## RL correction loop
-
-Designer corrections submitted via `POST /corrections` are saved to
-`data/exports/{job_id}_corrections.json`. Run periodically:
-
-```bash
-python main.py train --corrections data/exports/
-```
+| Type | Product | Wattage | Beam | Lumens | Zone |
+|------|---------|---------|------|--------|------|
+| A | MIKA80-E K1 Regalbeleuchtung | 15W | 40° | 2400lm | Inner sales floor |
+| B | MIKA80-E K4 Ergänzungsbeleuchtung | 20W | 60° | 3200lm | Supplementary |
+| C | MIKA80-E K3 Regalbeleuchtung Rand | 15W | 40° | 2400lm | Edge shelving |
+| D | MIKA80-E K2 Checkout/Service | 20W | 40° | 3200lm | Checkout / service |
+| E | NEO85-SX K6 Schaufenster-Strahler | 20W | 60° | 3200lm | Track / window |
 
 ---
 
 ## Placement algorithm
 
-1. Parse PDF → extract shelf height labels (`57`, `47`, `77`, `57/47`…)
-2. Filter labels to the calibrated sales-floor convex hull (from reference plan)
-3. Snap each label to the nearest **1250mm grid intersection**
+1. Parse DWG/DXF → extract shelf-height labels (`57`, `47`, `77`, `57/47` …)
+2. Filter labels to the calibrated sales-floor convex hull
+3. Snap each label to the nearest **1250 mm grid intersection**
 4. Deduplicate — one luminaire per grid node
-5. Classify: nodes inside the eroded hull (−1600mm) → **Type A** (15W 40°);
-   outer ring → **Type B** (20W 60°)
-6. Export DXF (luminaires as INSERT blocks), Excel BOM, PDF/HTML docs
+5. Classify zone → assign type (A–E)
+6. Export: AutoCAD LISP commands + DXF + Excel BOM + HTML documentation
 
-<!-- ---
+---
 
-## Docker
+## Docker deployment
 
 ```bash
-cd infra
-docker-compose up          # starts API :8000 + UI :3000
+# Build and start
+docker-compose up -d
+
+# Access API at http://localhost:8000
 ```
 
---- -->
+---
 
-## Open-source dependencies
+## Runtime files (not versioned)
+
+These files live in `~/ai-lighting/` and are generated at runtime:
+
+| File | Generated by | Purpose |
+|------|-------------|---------|
+| `lightingai_commands.lsp` | Bridge | AutoCAD commands — luminaires + legend |
+| `lightingai_typeconfig.json` | Config dialog | User's shape / color / description per type |
+| `lightingai_origin.json` | `LIGHTINGAI_SETUP` | Grid origin X/Y + pitch |
+| `lightingai_suggestions.json` | Bridge | Description suggestions for config dialog |
+
+---
+
+## Dependencies
 
 | Library | Purpose |
 |---------|---------|
-| `pymupdf` | PDF vector path extraction |
-| `ezdxf` | DXF read/write |
+| `ezdxf` | DWG/DXF read/write |
 | `shapely` | Polygon geometry |
-| `scikit-learn` | Zone classifier (RandomForest) |
+| `scikit-learn` | Zone classifier |
 | `fastapi` | REST API |
 | `openpyxl` | Excel BOM |
-| `jinja2` | PDF/HTML templates |
+| `jinja2` | HTML documentation |
 | `numpy` | Numerical operations |
+| `requests` | Bridge → API communication |
