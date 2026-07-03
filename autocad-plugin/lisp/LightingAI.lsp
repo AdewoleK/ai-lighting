@@ -26,6 +26,7 @@
 (setq LAI:ORIGIN-FILE      (strcat LAI:DATA-DIR "/lightingai_origin.json"))
 (setq LAI:COMMANDS-FILE    (strcat LAI:DATA-DIR "/lightingai_commands.lsp"))
 (setq LAI:TYPECONFIG-FILE  (strcat LAI:DATA-DIR "/lightingai_typeconfig.json"))
+(setq LAI:GRID-CFG-FILE    (strcat LAI:DATA-DIR "/lightingai_grid_config.json"))
 (setq LAI:BRIDGE-SCRIPT
   (strcat (getvar "ROAMABLEROOTPREFIX")
           "/../ai-lighting/autocad-plugin/lisp/lightingai_bridge.py"))
@@ -39,7 +40,7 @@
 (setq LAI:LAYERS
   (list "AI-LUMINAIRES" "AI-ZONES" "AI-GRID-ORIGIN"
         "AI-DECKENRASTER" "AI-RASTER-ANNO"
-        "AI-DIMENSIONS" "AI-LEGEND" "AI-TITLEBLOCK" "AI-ANNOTATIONS"))
+        "AI-DIMENSIONS" "AI-LEGEND" "AI-SCHEDULE" "AI-TITLEBLOCK" "AI-ANNOTATIONS"))
 
 ;; ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -61,17 +62,37 @@
   (lai:ensure-layer "AI-RASTER-ANNO"   2)  ; Yellow — Startmaß annotations
   (lai:ensure-layer "AI-DIMENSIONS"    7)
   (lai:ensure-layer "AI-LEGEND"        7)
+  (lai:ensure-layer "AI-SCHEDULE"      7)
   (lai:ensure-layer "AI-TITLEBLOCK"    7)
   (lai:ensure-layer "AI-ANNOTATIONS"   9))
 
-(defun lai:write-origin-file (x y pitch / fp)
-  ;; Write the grid origin as JSON so the Python bridge can read it
+(defun lai:write-origin-file (x y pitch fp-xmin fp-ymin fp-xmax fp-ymax / fp dwg-dir dwg-name dwg-full dwg-bytes)
+  ;; Write the grid origin + detected floor plan bounds to origin.json.
+  ;; The floor plan bounds (xmin/ymin/xmax/ymax) are the bounding box of the
+  ;; largest LWPOLYLINE detected by LIGHTINGAI_GRID — always the actual store
+  ;; footprint regardless of what else is in the DWG (title blocks, etc.).
+  ;; The bridge uses these bounds to position the legend correctly.
+  ;; DWG path is stored as Latin-1 byte values so non-ASCII chars survive.
+  (setq dwg-dir  (getvar "DWGPREFIX"))
+  (setq dwg-name (getvar "DWGNAME"))
+  (setq dwg-full (if (and dwg-dir (/= dwg-dir ""))
+                   (strcat dwg-dir dwg-name)
+                   dwg-name))
+  (setq dwg-bytes (lai:path-bytes dwg-full))
   (setq fp (open LAI:ORIGIN-FILE "w"))
   (write-line
-    (strcat "{\"x\": " (rtos x 2 4)
-            ", \"y\": " (rtos y 2 4)
-            ", \"pitch\": " (itoa pitch) "}")
+    (strcat "{\"x\": "         (rtos x 2 4)
+            ", \"y\": "        (rtos y 2 4)
+            ", \"pitch\": "    (itoa pitch)
+            ", \"fp_xmin\": "  (rtos fp-xmin 2 4)
+            ", \"fp_ymin\": "  (rtos fp-ymin 2 4)
+            ", \"fp_xmax\": "  (rtos fp-xmax 2 4)
+            ", \"fp_ymax\": "  (rtos fp-ymax 2 4)
+            ", \"dwg_bytes\": [" dwg-bytes "]}")
     fp)
+  (close fp)
+  (setq fp (open "/tmp/lai_dwg_bytes.txt" "w"))
+  (write-line dwg-bytes fp)
   (close fp))
 
 (defun lai:file-exists (path)
@@ -100,6 +121,26 @@
       (if (and (/= x 0.0) (/= y 0.0) (/= p 0.0))
         (list x y (fix p))
         nil))))
+
+;; ── Helper: read grid lineweight and color from lightingai_grid_config.json ──
+;; Format: {"lineweight": 25, "color": 253}
+(defun lai:read-grid-lw ( / fp line lw)
+  (if (not (lai:file-exists LAI:GRID-CFG-FILE)) nil
+    (progn
+      (setq fp (open LAI:GRID-CFG-FILE "r"))
+      (setq line (read-line fp))
+      (close fp)
+      (setq lw (atoi (cadr (quote-split line "\"lineweight\":"))))
+      (if (and (numberp lw) (>= lw 5) (<= lw 211)) lw nil))))
+
+(defun lai:read-grid-color ( / fp line c)
+  (if (not (lai:file-exists LAI:GRID-CFG-FILE)) nil
+    (progn
+      (setq fp (open LAI:GRID-CFG-FILE "r"))
+      (setq line (read-line fp))
+      (close fp)
+      (setq c (atoi (cadr (quote-split line "\"color\":"))))
+      (if (and (numberp c) (>= c 1) (<= c 256)) c nil))))
 
 ;; Helper: split string at a substring (simple one-shot)
 (defun quote-split (str sep / pos len)
@@ -145,6 +186,12 @@
   (setq pitch   1250.0)
   (setq START-X 1000.0)   ; 1.00m from left wall
   (setq START-Y 2000.0)   ; 2.00m from entry/bottom wall
+
+  ;; ── Read user-chosen line weight + color (set by GUI dialog) ────────────
+  (setq lai:grid-lw    (lai:read-grid-lw))
+  (setq lai:grid-color (lai:read-grid-color))
+  (if (null lai:grid-lw)    (setq lai:grid-lw    25))
+  (if (null lai:grid-color) (setq lai:grid-color 253))
 
   ;; ── Find store boundary from LWPOLYLINE entities ──────────────────────────
   ;; Scan every LWPOLYLINE for its bounding box.
@@ -249,8 +296,8 @@
         (entmake
           (list (cons 0 "LINE")
                 (cons 8 "AI-DECKENRASTER")
-                (cons 62 253)
-                (cons 370 30)
+                (cons 62 lai:grid-color)
+                (cons 370 lai:grid-lw)
                 (cons 10 (list gx ymin 0.0))
                 (cons 11 (list gx ymax 0.0))))
         (setq gx      (+ gx pitch))
@@ -265,8 +312,8 @@
         (entmake
           (list (cons 0 "LINE")
                 (cons 8 "AI-DECKENRASTER")
-                (cons 62 253)
-                (cons 370 30)
+                (cons 62 lai:grid-color)
+                (cons 370 lai:grid-lw)
                 (cons 10 (list xmin gy 0.0))
                 (cons 11 (list xmax gy 0.0))))
         (setq gy      (+ gy pitch))
@@ -313,8 +360,13 @@
                 (cons 50 0.0)
                 (cons 1 (strcat (rtos (/ offset-y 1000.0) 2 2) "m")))))
 
-      ;; ── Save origin for Python bridge ─────────────────────────────────────
-      (lai:write-origin-file ox oy (fix pitch))
+      ;; ── Save origin + auto-launch the AI bridge ──────────────────────────
+      ;; Pass the detected floor plan bounds so the bridge can position the
+      ;; legend relative to the actual store — not DWG artifacts.
+      (lai:write-origin-file ox oy (fix pitch) xmin ymin xmax ymax)
+      ;; Kick off the bridge in Terminal now so it processes while the user
+      ;; configures symbols.  By Step 3 (Place Lights) it will be done.
+      (lai:run-bridge-from-bytes)
 
       ;; ── Summary ───────────────────────────────────────────────────────────
       (setq area-m2 (/ (abs (* (- xmax xmin) (- ymax ymin))) 1.0e6))
@@ -323,7 +375,8 @@
                                       (itoa (* x-count y-count)) " intersections)"))
       (lai:println (strcat "Area:  " (rtos area-m2 2 1) " m2"))
       (lai:println "Layer: AI-DECKENRASTER (color 253) + AI-RASTER-ANNO (yellow)")
-      (lai:println "Next:  run Python bridge in Terminal, then LIGHTINGAI_PLACE")
+      (lai:println "AI bridge launched in Terminal — configure symbols while it runs.")
+      (lai:println "When Terminal says Done, click Place Lights.")
       (lai:println "Clear: LIGHTINGAI_CLEAR")
     )
     (progn
@@ -381,8 +434,8 @@
 
   (setvar "CLAYER" "0")
 
-  ;; Save to file for the Python bridge
-  (lai:write-origin-file (car pt) (cadr pt) pitch)
+  ;; Manual setup: no auto-detected floor plan bounds; bridge falls back to zone bounds.
+  (lai:write-origin-file (car pt) (cadr pt) pitch 0 0 0 0)
 
   (lai:println (strcat "Grid origin set:  X=" (rtos (car pt) 2 1)
                        "  Y=" (rtos (cadr pt) 2 1)
@@ -401,29 +454,20 @@
 (defun c:LIGHTINGAI_PLACE ( / cmdfile)
   (setq cmdfile LAI:COMMANDS-FILE)
 
-  ;; Step 2 check: LIGHTINGAI_CONFIG is required before placing
   (if (not (lai:file-exists LAI:TYPECONFIG-FILE))
     (progn
-      (lai:println "╔══════════════════════════════════════════════════════════╗")
-      (lai:println "║  STOP — Step 2 not completed!                            ║")
-      (lai:println "║  Run LIGHTINGAI_CONFIG first to choose light symbols.    ║")
-      (lai:println "║  This step is REQUIRED before placing lights.            ║")
-      (lai:println "╚══════════════════════════════════════════════════════════╝")
+      (lai:println "No symbol config found — open the LightingAI panel and configure symbols first.")
       (exit)))
 
   (if (not (lai:file-exists cmdfile))
     (progn
-      (lai:println "Commands file not found. Run the Python bridge first:")
-      (lai:println "  Terminal:  python3 ~/ai-lighting/autocad-plugin/lisp/lightingai_bridge.py")
-      (lai:println (strcat "  Expected:  " cmdfile))
+      (lai:println "No commands file yet — the AI bridge is still running in Terminal.")
+      (lai:println "Wait for Terminal to show 'Done', then click Place Lights again.")
       (exit)))
 
-  (lai:println "Loading luminaire placements…")
+  (lai:println "Placing luminaires…")
   (lai:ensure-all-layers)
-
-  ;; The Python bridge wrote LISP code — load and run it
   (load cmdfile)
-
   (lai:println "Done. All luminaires placed.")
   (lai:println "Run LIGHTINGAI_CLEAR to remove them and start over.")
   (princ))
@@ -445,6 +489,21 @@
 ;; Writes a shell script + AppleScript, then fires osascript to open
 ;; a Terminal window and run the Python bridge inside it.
 ;;
+;; Convert a file-path string to a comma-separated list of decimal byte values.
+;; AutoCAD LISP writes files in Latin-1; macOS paths are UTF-8.  Writing the
+;; raw string into a shell script corrupts non-ASCII chars (e.g. Ö → 0xD6 in
+;; the file, but the filesystem expects UTF-8 0xC3 0x96).  Passing the bytes as
+;; integers lets Python reconstruct the string with the correct encoding.
+(defun lai:path-bytes (s / i result b)
+  (setq result "" i 0)
+  (while (< i (strlen s))
+    (setq b (vl-string-elt s i))
+    (setq result (strcat result (if (> i 0) "," "") (itoa b)))
+    (setq i (1+ i))
+  )
+  result
+)
+
 (defun lai:run-bridge (dwg-path / fp)
   (setq dwg-path (vl-string-trim " " (if dwg-path dwg-path "")))
   (cond
@@ -453,23 +512,37 @@
     ((not (findfile dwg-path))
      (lai:println (strcat "File not found: " dwg-path)))
     (T
-     ;; 1. Write a shell script that runs the bridge and waits
+     ;; 1. Write the DWG path as decimal byte values — pure ASCII, no encoding issues.
+     ;;    Python will decode bytes([...]).decode('latin-1') back to the correct path.
+     (setq fp (open "/tmp/lai_dwg_bytes.txt" "w"))
+     (write-line (lai:path-bytes dwg-path) fp)
+     (close fp)
+
+     ;; 2. Write the shell script.  Uses a Python heredoc so no shell-quoting
+     ;;    gymnastics are needed around the decoded path.
      (setq fp (open "/tmp/lai_bridge.sh" "w"))
      (write-line "#!/bin/bash" fp)
      (write-line "cd ~/ai-lighting" fp)
-     (write-line (strcat "python3 autocad-plugin/lisp/lightingai_bridge.py \"" dwg-path "\"") fp)
+     (write-line "python3 - <<'PYEOF'" fp)
+     (write-line "import subprocess" fp)
+     (write-line "raw = open('/tmp/lai_dwg_bytes.txt').read().strip()" fp)
+     (write-line "path = bytes([int(x) for x in raw.split(',')]).decode('latin-1')" fp)
+     (write-line "subprocess.run(['python3', 'autocad-plugin/lisp/lightingai_bridge.py', path])" fp)
+     (write-line "PYEOF" fp)
      (write-line "" fp)
      (write-line "echo ''" fp)
      (write-line "echo '[LightingAI] Done. Return to AutoCAD and click Step 4: Place Lights.'" fp)
      (close fp)
-     ;; 2. Write an AppleScript that opens Terminal and runs the script
+
+     ;; 3. Write an AppleScript that opens Terminal and runs the script
      (setq fp (open "/tmp/lai_bridge.scpt" "w"))
      (write-line "tell application \"Terminal\"" fp)
      (write-line "  activate" fp)
      (write-line "  do script \"bash /tmp/lai_bridge.sh\"" fp)
      (write-line "end tell" fp)
      (close fp)
-     ;; 3. Write a tiny Python launcher that runs osascript.
+
+     ;; 4. Write a tiny Python launcher that runs osascript.
      ;;    Python.app is a real .app bundle so startapp works; osascript is not.
      (setq fp (open "/tmp/lai_bridge_launcher.py" "w"))
      (write-line "import subprocess" fp)
@@ -516,18 +589,83 @@
 ;; ── LIGHTINGAI_BRIDGE_STEP ────────────────────────────────────────────────────
 ;;
 ;; Called by the GUI when the user clicks Step 3.
-;; Opens a native file browser, then runs the AI bridge in Terminal.
+;; Reads the DWG path recorded by LIGHTINGAI_GRID in Step 1.
+;; No file picker — the system already knows which floor plan is active.
 ;;
-(defun c:LIGHTINGAI_BRIDGE_STEP ( / f)
-  (setq f (getfiled "Select DWG floor plan"
-                    (if (and LAI:LAST-DWG (/= LAI:LAST-DWG ""))
-                        LAI:LAST-DWG "")
-                    "dwg" 8))
-  (if f
+(defun c:LIGHTINGAI_BRIDGE_STEP ( / origin-fp line json-str bytes-start bytes-end bytes-str dwg-path)
+  (if (not (lai:file-exists LAI:ORIGIN-FILE))
     (progn
-      (setq LAI:LAST-DWG f)
-      (lai:run-bridge f))
-    (lai:println "No file selected — Step 3 skipped."))
+      (lai:println "╔══════════════════════════════════════════════════════════╗")
+      (lai:println "║  STOP — Step 1 not completed!                            ║")
+      (lai:println "║  Run LIGHTINGAI_GRID first to detect the floor plan.     ║")
+      (lai:println "╚══════════════════════════════════════════════════════════╝")
+      (exit)))
+
+  ;; Read the dwg_bytes array from origin.json and reconstruct the path.
+  ;; The bytes were written by lai:write-origin-file as Latin-1 decimal ints.
+  (setq origin-fp (open LAI:ORIGIN-FILE "r"))
+  (setq json-str (read-line origin-fp))
+  (close origin-fp)
+
+  ;; Extract the array: find "[" after "dwg_bytes" and "]" after it
+  (setq bytes-start (vl-string-search "[" json-str
+                       (vl-string-search "dwg_bytes" json-str 0)))
+  (setq bytes-end   (vl-string-search "]" json-str bytes-start))
+
+  (if (or (null bytes-start) (null bytes-end))
+    (progn
+      ;; origin.json written by old code without dwg_bytes — fall back to file picker
+      (lai:println "Grid file predates this update. Run LIGHTINGAI_GRID again to refresh.")
+      (exit)))
+
+  (setq bytes-str (substr json-str (+ bytes-start 2) (- bytes-end bytes-start 1)))
+
+  ;; Write byte list to a temp file; the shell script's Python will decode it
+  (setq origin-fp (open "/tmp/lai_dwg_bytes.txt" "w"))
+  (write-line bytes-str origin-fp)
+  (close origin-fp)
+
+  ;; Verify the decoded path will be valid before launching Terminal
+  (lai:run-bridge-from-bytes)
+  (princ))
+
+;; Launch the bridge using the byte-encoded DWG path in /tmp/lai_dwg_bytes.txt
+(defun lai:run-bridge-from-bytes ( / fp)
+  (setq fp (open "/tmp/lai_bridge.sh" "w"))
+  (write-line "#!/bin/bash" fp)
+  (write-line "cd ~/ai-lighting" fp)
+  (write-line "python3 - <<'PYEOF'" fp)
+  (write-line "import subprocess, os" fp)
+  (write-line "raw = open('/tmp/lai_dwg_bytes.txt').read().strip()" fp)
+  (write-line "path = bytes([int(x) for x in raw.split(',')]).decode('latin-1')" fp)
+  (write-line "if not os.path.exists(path):" fp)
+  (write-line "    print(f'[LightingAI] ERROR: File not found: {path}')" fp)
+  (write-line "    raise SystemExit(1)" fp)
+  (write-line "print(f'[LightingAI] Processing: {os.path.basename(path)}')" fp)
+  (write-line "result = subprocess.run(['python3', 'autocad-plugin/lisp/lightingai_bridge.py', path])" fp)
+  (write-line "PYEOF" fp)
+  (write-line "" fp)
+  (write-line "echo ''" fp)
+  (write-line "echo '[LightingAI] Done. Return to AutoCAD and click Step 4: Place Lights.'" fp)
+  (close fp)
+
+  (setq fp (open "/tmp/lai_bridge.scpt" "w"))
+  (write-line "tell application \"Terminal\"" fp)
+  (write-line "  activate" fp)
+  (write-line "  do script \"bash /tmp/lai_bridge.sh\"" fp)
+  (write-line "end tell" fp)
+  (close fp)
+
+  (setq fp (open "/tmp/lai_bridge_launcher.py" "w"))
+  (write-line "import subprocess" fp)
+  (write-line "subprocess.run(['/usr/bin/osascript', '/tmp/lai_bridge.scpt'])" fp)
+  (close fp)
+
+  (startapp
+    "/Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app"
+    "/tmp/lai_bridge_launcher.py")
+  (lai:println "Bridge launched for the current floor plan.")
+  (lai:println "Watch Terminal. When it says Done, click Step 4: Place Lights.")
   (princ))
 
 

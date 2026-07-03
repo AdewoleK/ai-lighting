@@ -81,6 +81,12 @@ lightingai_commands.lsp
 lightingai_origin.json
 lightingai_suggestions.json
 lightingai_typeconfig.json
+lightingai_pitch.json
+lightingai_grid_config.json
+lightingai_summary.json
+
+# AutoCAD command scratch file — not part of source
+command.txt
 
 # Docker test artifacts
 ai-lighting-data/
