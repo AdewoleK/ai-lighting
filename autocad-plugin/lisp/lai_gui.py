@@ -127,7 +127,69 @@ def draw_shape(canvas, shape_name: str, hex_color: str, size: int = 32) -> None:
 
 # ── Step 1: grid line-thickness + color picker ───────────────────────────────
 _GRID_CFG_FILE  = pathlib.Path.home() / "ai-lighting" / "lightingai_grid_config.json"
-_SUMMARY_FILE   = pathlib.Path.home() / "ai-lighting" / "lightingai_summary.json"
+_SUMMARY_FILE        = pathlib.Path.home() / "ai-lighting" / "lightingai_summary.json"
+_CUSTOM_DESCS_FILE   = pathlib.Path.home() / "ai-lighting" / "lightingai_custom_descs.json"
+_MAX_CUSTOM_DESCS    = 15
+
+
+def _load_custom_descs() -> list:
+    """Return user-saved custom descriptions, most-recent first."""
+    try:
+        if _CUSTOM_DESCS_FILE.exists():
+            data = json.loads(_CUSTOM_DESCS_FILE.read_text(encoding='utf-8'))
+            if isinstance(data, list):
+                return [str(d).strip() for d in data if str(d).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _save_custom_desc(desc: str) -> None:
+    """Persist a custom description; deduplicates and keeps most-recent at top."""
+    desc = desc.strip()
+    if not desc:
+        return
+    existing = _load_custom_descs()
+    existing = [d for d in existing if d != desc]
+    existing.insert(0, desc)
+    existing = existing[:_MAX_CUSTOM_DESCS]
+    try:
+        _CUSTOM_DESCS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _CUSTOM_DESCS_FILE.write_text(
+            json.dumps(existing, ensure_ascii=False, indent=2), encoding='utf-8'
+        )
+    except Exception:
+        pass
+
+
+def _delete_custom_desc(desc: str) -> None:
+    """Remove a custom description from the persistent list."""
+    existing = _load_custom_descs()
+    existing = [d for d in existing if d != desc]
+    try:
+        _CUSTOM_DESCS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _CUSTOM_DESCS_FILE.write_text(
+            json.dumps(existing, ensure_ascii=False, indent=2), encoding='utf-8'
+        )
+    except Exception:
+        pass
+
+
+def _edit_custom_desc(old: str, new: str) -> None:
+    """Replace an existing custom description in-place, preserving its list position."""
+    new = new.strip()
+    if not new:
+        return
+    existing = _load_custom_descs()
+    existing = [new if d == old else d for d in existing]
+    try:
+        _CUSTOM_DESCS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _CUSTOM_DESCS_FILE.write_text(
+            json.dumps(existing, ensure_ascii=False, indent=2), encoding='utf-8'
+        )
+    except Exception:
+        pass
+
 
 # AutoCAD lineweight enum values (hundredths of mm)
 # Each tuple: (acad_lw_int, label, mm_string, preview_px)
@@ -361,9 +423,10 @@ def open_config_dialog():
     dlg.attributes('-topmost', True)
     dlg.lift()
 
-    W, H = 460, 630
+    W = 460
     sw = dlg.winfo_screenwidth()
     sh = dlg.winfo_screenheight()
+    H = min(900, int(sh * 0.88))   # tall enough to show everything; caps at 88% of screen
     dlg.geometry(f"{W}x{H}+{max(0, (sw - W) // 2 - 160)}+{max(0, (sh - H) // 2)}")
 
     # ── Load existing config so previous settings are preserved ─────────────
@@ -402,7 +465,7 @@ def open_config_dialog():
     n_row = tk.Frame(dlg, bg='#111419')
     n_row.pack(fill='x', padx=16, pady=(12, 4))
     tk.Label(n_row, text="How many light types?",
-             font=('Helvetica', 11), bg='#111419', fg='#8892a4').pack(side='left')
+             font=('Helvetica', 15), bg='#111419', fg='#FFFFFF').pack(side='left')
 
     def change_n(delta):
         v = num_types.get() + delta
@@ -410,14 +473,14 @@ def open_config_dialog():
             num_types.set(v)
             rebuild_tabs()
 
-    tk.Button(n_row, text="−", font=('Helvetica', 13, 'bold'),
-              bg='#1e2330', fg='#e0e6f0', relief='flat',
+    tk.Button(n_row, text="−", font=('Helvetica', 15, 'bold'),
+              bg='#1e2330', fg='#111419', relief='flat',
               padx=10, pady=2, cursor='hand2',
               command=lambda: change_n(-1)).pack(side='left', padx=(14, 4))
     tk.Label(n_row, textvariable=num_types, font=('Helvetica', 14, 'bold'),
              bg='#111419', fg='#e040fb', width=2).pack(side='left')
-    tk.Button(n_row, text="+", font=('Helvetica', 13, 'bold'),
-              bg='#1e2330', fg='#e0e6f0', relief='flat',
+    tk.Button(n_row, text="+", font=('Helvetica', 15, 'bold'),
+              bg='#1e2330', fg="#111419", relief='flat',
               padx=10, pady=2, cursor='hand2',
               command=lambda: change_n(1)).pack(side='left', padx=(4, 0))
 
@@ -456,10 +519,34 @@ def open_config_dialog():
                       command=lambda x=i: select_type(x))
         type_btns.append(b)
 
-    # ── Content card ─────────────────────────────────────────────────────────
+    # ── Scrollable content card ───────────────────────────────────────────────
     tk.Frame(dlg, bg='#252c3a', height=1).pack(fill='x', padx=16, pady=(8, 0))
-    card = tk.Frame(dlg, bg='#181c24')
-    card.pack(fill='both', expand=True, padx=16, pady=0)
+
+    card_outer = tk.Frame(dlg, bg='#181c24')
+    card_outer.pack(fill='both', expand=True, padx=16, pady=0)
+
+    card_canvas = tk.Canvas(card_outer, bg='#181c24', highlightthickness=0)
+    card_canvas.pack(side='left', fill='both', expand=True)
+
+    card_sb = tk.Scrollbar(card_outer, orient='vertical', command=card_canvas.yview)
+    card_sb.pack(side='right', fill='y')
+    card_canvas.configure(yscrollcommand=card_sb.set)
+
+    card = tk.Frame(card_canvas, bg='#181c24')
+    _card_win = card_canvas.create_window((0, 0), window=card, anchor='nw')
+
+    def _on_card_canvas_resize(e):
+        card_canvas.itemconfig(_card_win, width=e.width)
+    card_canvas.bind('<Configure>', _on_card_canvas_resize)
+
+    def _on_card_content_change(e):
+        card_canvas.configure(scrollregion=card_canvas.bbox('all'))
+    card.bind('<Configure>', _on_card_content_change)
+
+    def _card_mousewheel(e):
+        card_canvas.yview_scroll(int(-1 * (e.delta / 120)), 'units')
+    card_canvas.bind('<MouseWheel>', _card_mousewheel)
+    card.bind('<MouseWheel>', _card_mousewheel)
 
     # Shape rows — 5 per row, 2 rows
     tk.Label(card, text="SHAPE",
@@ -504,12 +591,7 @@ def open_config_dialog():
         lbl.pack()
         color_widgets.append((c, lbl, cl, col))
 
-    # Description combobox — suggestions loaded from last bridge run
-    tk.Label(card, text="DESCRIPTION  (choose from list or type your own)",
-             font=('Helvetica', 9, 'bold'), bg='#181c24', fg='#3a4254',
-             anchor='w').pack(fill='x', padx=14, pady=(14, 4))
-
-    # Canonical Rossmann product catalog — always shown in dropdown, always distinct
+    # ── Description Manager ───────────────────────────────────────────────
     _CANONICAL_DESCS = [
         "MIKA80-E K1 Regalbeleuchtung 15W 40° 2400lm 3000K",
         "MIKA80-E K4 Ergänzungsbeleuchtung 20W 60° 3200lm 3000K",
@@ -517,38 +599,233 @@ def open_config_dialog():
         "MIKA80-E K2 Checkout/Service 20W 40° 3200lm 3000K",
         "NEO85-SX K6 Schaufenster-Strahler 20W 60° 3200lm Track",
     ]
-    _all_suggestions: list = _CANONICAL_DESCS
+    _DESC_PLACEHOLDER = "Type your light description here..."
 
-    # ttk style so the combobox matches the dark theme
-    _style = ttk.Style()
-    _style.configure('Dark.TCombobox',
-                     fieldbackground='#0d1117', background='#1e2330',
-                     foreground='#e0e6f0', selectbackground='#e040fb',
-                     selectforeground='#111419', arrowcolor='#e0e6f0')
+    # — Section header ─────────────────────────────────────────────────────
+    tk.Frame(card, bg='#252c3a', height=1).pack(fill='x', padx=14, pady=(16, 0))
+    desc_hdr_row = tk.Frame(card, bg='#181c24')
+    desc_hdr_row.pack(fill='x', padx=14, pady=(10, 2))
+    tk.Label(desc_hdr_row, text="LIGHT DESCRIPTION",
+             font=('Helvetica', 12, 'bold'), bg='#181c24', fg='#c0cce0',
+             anchor='w').pack(side='left')
+    tk.Label(desc_hdr_row, text="or pick from the list below",
+             font=('Helvetica', 10), bg='#181c24', fg='#5c6680',
+             anchor='e').pack(side='right')
 
+    # — Entry with placeholder ─────────────────────────────────────────────
     desc_var = tk.StringVar()
-    desc_combo = ttk.Combobox(card, textvariable=desc_var,
-                              values=_all_suggestions,
-                              font=('Helvetica', 10),
-                              style='Dark.TCombobox',
-                              state='normal')
-    desc_combo.pack(fill='x', padx=14, ipady=4)
+    desc_entry = tk.Entry(card, textvariable=desc_var,
+                          font=('Helvetica', 12),
+                          bg='#0d1117', fg='#5c6680',
+                          insertbackground='#e040fb',
+                          relief='flat', bd=0,
+                          highlightthickness=2,
+                          highlightbackground='#2a3248',
+                          highlightcolor='#e040fb')
+    desc_entry.pack(fill='x', padx=14, ipady=9, pady=(0, 0))
 
-    def _update_combo_suggestions():
-        """Refresh dropdown list — always show all 5 canonical descriptions, deduplicated."""
-        current = desc_var.get().strip()
-        seen_vals: set = set()
-        combined: list = []
-        for v in ([current] if current else []) + _CANONICAL_DESCS:
-            if v and v not in seen_vals:
-                combined.append(v)
-                seen_vals.add(v)
-        desc_combo['values'] = combined
+    def _is_placeholder():
+        return desc_var.get() == _DESC_PLACEHOLDER
+
+    def _show_placeholder():
+        desc_var.set(_DESC_PLACEHOLDER)
+        desc_entry.configure(fg='#5c6680')
+
+    def _clear_placeholder(e=None):
+        if _is_placeholder():
+            desc_var.set('')
+            desc_entry.configure(fg='#e8eeff')
+
+    def _restore_if_empty(e=None):
+        if not desc_var.get().strip():
+            _show_placeholder()
+
+    desc_entry.bind('<FocusIn>',  _clear_placeholder)
+    desc_entry.bind('<FocusOut>', _restore_if_empty)
 
     def _on_desc_change(*_):
+        if _is_placeholder():
+            return
         selections[active_idx.get()]['description'] = desc_var.get()
 
     desc_var.trace_add('write', _on_desc_change)
+    _show_placeholder()
+
+    # — Unified list: My Saved + Standard Catalog ─────────────────────────
+    list_hdr = tk.Frame(card, bg='#181c24')
+    list_hdr.pack(fill='x', padx=14, pady=(14, 2))
+    tk.Label(list_hdr, text="ALL DESCRIPTIONS",
+             font=('Helvetica', 11, 'bold'), bg='#181c24', fg='#8892a4').pack(side='left')
+
+    def _do_add_to_list():
+        val = desc_var.get().strip()
+        if not val or _is_placeholder() or val in _CANONICAL_DESCS:
+            return
+        _save_custom_desc(val)
+        _rebuild_list()
+
+    tk.Button(list_hdr, text="  + Add to My List  ",
+              font=('Helvetica', 10, 'bold'), bg='#2a1a3e', fg='#e040fb',
+              activebackground='#3a2050', activeforeground='#ff70ff',
+              relief='flat', padx=4, pady=4, cursor='hand2',
+              command=_do_add_to_list).pack(side='right')
+
+    list_outer = tk.Frame(card, bg='#0d1117',
+                          highlightthickness=1, highlightbackground='#2a3248')
+    list_outer.pack(fill='x', padx=14, pady=(0, 8))
+
+    list_canvas = tk.Canvas(list_outer, bg='#0d1117', highlightthickness=0)
+    list_canvas.pack(side='left', fill='x', expand=True)
+
+    list_sb = tk.Scrollbar(list_outer, orient='vertical', command=list_canvas.yview)
+    list_canvas.configure(yscrollcommand=list_sb.set)
+
+    list_inner = tk.Frame(list_canvas, bg='#0d1117')
+    _list_win_id = list_canvas.create_window((0, 0), window=list_inner, anchor='nw')
+
+    def _on_list_resize(e):
+        list_canvas.itemconfig(_list_win_id, width=e.width)
+    list_canvas.bind('<Configure>', _on_list_resize)
+
+    def _use_desc(d):
+        desc_entry.configure(fg='#e8eeff')
+        desc_var.set(d)
+
+    def _do_inline_edit(old_desc, row_frame):
+        for w in row_frame.winfo_children():
+            w.destroy()
+        edit_var = tk.StringVar(value=old_desc)
+        edit_ent = tk.Entry(row_frame, textvariable=edit_var,
+                            font=('Helvetica', 11), bg='#1a2b42', fg='#e8eeff',
+                            insertbackground='#e040fb', relief='flat', bd=0,
+                            highlightthickness=2, highlightcolor='#5c9fff',
+                            highlightbackground='#5c9fff')
+        edit_ent.pack(side='left', fill='x', expand=True, padx=8, pady=5)
+        edit_ent.select_range(0, 'end')
+        edit_ent.focus_set()
+
+        def _confirm():
+            new = edit_var.get().strip()
+            if new and new != old_desc:
+                _edit_custom_desc(old_desc, new)
+                if desc_var.get() == old_desc:
+                    _use_desc(new)
+            _rebuild_list()
+
+        edit_ent.bind('<Return>', lambda e: _confirm())
+        edit_ent.bind('<Escape>', lambda e: _rebuild_list())
+
+        tk.Button(row_frame, text=" ✓ ",
+                  font=('Helvetica', 11, 'bold'), bg='#16111e', fg='#40e090',
+                  activebackground='#1a2e1a', relief='flat', padx=4, cursor='hand2',
+                  command=_confirm).pack(side='right', padx=(0, 2))
+        tk.Button(row_frame, text=" ✕ ",
+                  font=('Helvetica', 11, 'bold'), bg='#16111e', fg='#ff5c7a',
+                  activebackground='#2a1520', relief='flat', padx=4, cursor='hand2',
+                  command=_rebuild_list).pack(side='right')
+
+    def _rebuild_list():
+        for w in list_inner.winfo_children():
+            w.destroy()
+        custom = _load_custom_descs()
+
+        # ── MY SAVED ─────────────────────────────────────────────────────
+        my_lbl_row = tk.Frame(list_inner, bg='#0d1117')
+        my_lbl_row.pack(fill='x', padx=10, pady=(8, 3))
+        tk.Label(my_lbl_row, text="MY SAVED",
+                 font=('Helvetica', 10, 'bold'), bg='#0d1117', fg='#e040fb').pack(side='left')
+
+        if not custom:
+            hint_bg = '#0b0e18'
+            hint = tk.Frame(list_inner, bg=hint_bg)
+            hint.pack(fill='x', padx=6, pady=(0, 6))
+            tk.Label(hint,
+                     text="Type your description above, then click\n"
+                          "\"+  Add to My List\" to save it here.",
+                     font=('Helvetica', 10), bg=hint_bg, fg='#6a7890',
+                     justify='left').pack(padx=14, pady=10, anchor='w')
+        else:
+            for desc in custom:
+                row = tk.Frame(list_inner, bg='#16111e', cursor='hand2')
+                row.pack(fill='x', pady=1)
+
+                dot = tk.Label(row, text="  ●",
+                               font=('Helvetica', 10), bg='#16111e', fg='#e040fb')
+                dot.pack(side='left', pady=6)
+                dot.bind('<Button-1>', lambda e, d=desc: _use_desc(d))
+
+                lbl = tk.Label(row, text=desc,
+                               font=('Helvetica', 10), bg='#16111e', fg='#e8c0ff',
+                               anchor='w', cursor='hand2')
+                lbl.pack(side='left', fill='x', expand=True, padx=4, pady=6)
+                lbl.bind('<Button-1>', lambda e, d=desc: _use_desc(d))
+                row.bind('<Button-1>', lambda e, d=desc: _use_desc(d))
+
+                def _start_edit(d=desc, r=row):
+                    _do_inline_edit(d, r)
+
+                def _do_delete(d=desc):
+                    _delete_custom_desc(d)
+                    _rebuild_list()
+
+                tk.Button(row, text=" ✎ ",
+                          font=('Helvetica', 11), bg='#16111e', fg='#5c9fff',
+                          activebackground='#1e2a3a', activeforeground='#90c8ff',
+                          relief='flat', cursor='hand2',
+                          command=_start_edit).pack(side='right', padx=(0, 2), pady=4)
+                tk.Button(row, text=" ✕ ",
+                          font=('Helvetica', 11), bg='#16111e', fg='#ff5c7a',
+                          activebackground='#2a1520', activeforeground='#ff90a0',
+                          relief='flat', cursor='hand2',
+                          command=_do_delete).pack(side='right', pady=4)
+
+        # ── STANDARD CATALOG divider ──────────────────────────────────────
+        div = tk.Frame(list_inner, bg='#0d1117')
+        div.pack(fill='x', padx=10, pady=(10, 4))
+        tk.Frame(div, bg='#2a3248', height=1).pack(
+            fill='x', side='left', expand=True, pady=7)
+        tk.Label(div, text="  STANDARD CATALOG  ",
+                 font=('Helvetica', 9, 'bold'), bg='#0d1117', fg='#5c6680').pack(side='left')
+        tk.Frame(div, bg='#2a3248', height=1).pack(
+            fill='x', side='left', expand=True, pady=7)
+
+        # ── Catalog rows ──────────────────────────────────────────────────
+        for cat_desc in _CANONICAL_DESCS:
+            cat_row = tk.Frame(list_inner, bg='#0d1117', cursor='hand2')
+            cat_row.pack(fill='x')
+            tk.Frame(cat_row, bg='#131820', height=1).pack(fill='x')
+            cat_lbl = tk.Label(cat_row, text=cat_desc,
+                               font=('Helvetica', 10), bg='#0d1117', fg='#9aaabe',
+                               anchor='w', cursor='hand2')
+            cat_lbl.pack(fill='x', padx=12, pady=6)
+            cat_lbl.bind('<Button-1>', lambda e, d=cat_desc: _use_desc(d))
+            cat_row.bind('<Button-1>', lambda e, d=cat_desc: _use_desc(d))
+
+            def _make_hover(r, lbl):
+                def _on(e):
+                    r.configure(bg='#141c2e')
+                    lbl.configure(bg='#141c2e', fg='#e8eeff')
+                def _off(e):
+                    r.configure(bg='#0d1117')
+                    lbl.configure(bg='#0d1117', fg='#9aaabe')
+                r.bind('<Enter>', _on);   r.bind('<Leave>', _off)
+                lbl.bind('<Enter>', _on); lbl.bind('<Leave>', _off)
+            _make_hover(cat_row, cat_lbl)
+
+        # ── Resize canvas ─────────────────────────────────────────────────
+        n_custom = len(custom) if custom else 1
+        n_total  = n_custom + len(_CANONICAL_DESCS) + 3
+        new_h    = min(n_total * 34 + 20, 260)
+        list_canvas.configure(height=new_h)
+        if n_total * 34 + 20 > 260:
+            list_sb.pack(side='right', fill='y')
+        else:
+            list_sb.pack_forget()
+
+        list_inner.update_idletasks()
+        list_canvas.configure(scrollregion=list_canvas.bbox('all'))
+
+    _rebuild_list()
 
     # Preview row
     tk.Frame(card, bg='#252c3a', height=1).pack(fill='x', padx=14, pady=(10, 0))
@@ -584,8 +861,7 @@ def open_config_dialog():
                         highlightthickness=3 if active else 2)
             lbl.configure(fg='#e0e6f0' if active else '#3a4254')
 
-        desc_var.set(sel.get('description', ''))
-        _update_combo_suggestions()
+        _show_placeholder()
         draw_shape(preview_c, shp, chex, size=48)
         preview_lbl.configure(text=f"{shp}  ·  {clr}")
 
