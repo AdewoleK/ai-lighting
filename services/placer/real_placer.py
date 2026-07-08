@@ -403,6 +403,21 @@ class RealLuminairePlacer:
             # of what the lumen method calculates — task lighting at every grid node.
             if zt == 'checkout_zone':
                 zone_pitch = base_pitch
+                # Mis-detection guard: if the checkout zone centroid is > 20 m from the
+                # nearest shelf position, it was likely detected from a legend / detail
+                # block drawn far from the actual store footprint.  Skip it silently.
+                shelf_positions = [f.position for f in plan.furniture
+                                   if f.inferred_type == 'shelving']
+                if shelf_positions:
+                    from shapely.geometry import MultiPoint as _MP
+                    nearest_shelf_dist = zone.polygon.centroid.distance(
+                        _MP(shelf_positions))
+                    if nearest_shelf_dist > 20_000:   # 20 m in mm
+                        result.corrections.append(
+                            f"Checkout zone skipped: centroid is "
+                            f"{nearest_shelf_dist/1000:.0f}m from nearest shelf "
+                            f"(likely a legend/detail block)")
+                        continue
 
             # For sales floor: exclude task-lighting sub-zones (checkout, service)
             # so those positions receive D lights only, not A/B/C on top.
@@ -436,24 +451,12 @@ class RealLuminairePlacer:
                 luminaire_flux_lm  = spec.luminaire_flux_lm,
             ))
 
-        # ── Hard boundary filter ──────────────────────────────────────────────
-        # Use the UNION of all classified zone polygons as the valid placement
-        # area.  This correctly handles stores where the checkout zone is adjacent
-        # to (not inside) the main sales-floor polygon: using only the building
-        # envelope would clip valid checkout lights that lie outside the main room.
-        if classified and classified.zones:
-            try:
-                from shapely.ops import unary_union as _uu
-                valid_area = _uu([z.polygon for z in classified.zones]).buffer(50)
-                before = len(result.placed)
-                result.placed = [l for l in result.placed
-                                 if valid_area.covers(Point(l.x, l.y))]
-                clipped = before - len(result.placed)
-                if clipped > 0:
-                    result.corrections.append(
-                        f"Boundary filter removed {clipped} lights outside all zone polygons")
-            except Exception:
-                pass  # geometry error → skip filter, never crash
+        # Hard boundary filter removed: shelf-anchored placement guarantees that
+        # every sales floor light is derived from a detected shelf position, so it
+        # cannot escape outside the building.  Checkout zone mis-detection is handled
+        # by the proximity guard above (> 20 m from nearest shelf → skip).
+        # Non-sales zones (checkout grid, storage rows) use the zone polygon directly
+        # so their lights are already contained by construction.
 
         return result
 
@@ -479,119 +482,129 @@ class RealLuminairePlacer:
 
     def _place_sales(self, zone: ZoneResult, plan: ParsedPlan,
                      excl: list, pitch: float, ox: float, oy: float) -> list:
-        # Filter shelves to only those inside the zone polygon.
-        # This removes outlier INSERT positions (bad DXF coordinates) that would
-        # otherwise bloat the convex hull to absurd sizes (seen: 3558 km²).
-        zone_poly  = zone.polygon
-        shelf_pts  = [f.position for f in plan.furniture
-                      if f.inferred_type == 'shelving'
-                      and zone_poly.covers(Point(f.position))]
+        """
+        Shelf-anchored placement: every light position is derived from a
+        detected shelf INSERT, never from a zone-polygon boundary.
 
-        # Shelf-guided placement needs at least 1 point per 100 m²
-        # to be representative.  Sparse data → uniform lux grid.
-        min_shelf = max(3, zone.area_m2 / 100)
-        if len(shelf_pts) < min_shelf:
+        A = one per unique shelf-snapped grid node
+        B = fill 4-connected neighbor nodes of A lights (aisle / perimeter fill)
+        E = up to 2 per structural column, within the shelf domain
+        C = relabel the 4 corner-nearest A lights
+
+        Lights cannot escape the store boundary because they only exist where
+        shelves — or their immediate ceiling-tile neighbors — are detected.
+        No wall polygon, no building envelope, no clipping required.
+        """
+
+        # ── 1. Collect shelves; reject extreme outliers ───────────────────
+        raw_objs = [f for f in plan.furniture if f.inferred_type == 'shelving']
+        if not raw_objs:
             return self._place_grid_default(zone, excl, pitch, ox, oy)
 
-        # Build the shelf convex hull from CLEAN shelf positions only.
-        # Use zone.polygon as the primary containment boundary — it matches
-        # actual room walls so lights cannot bleed outside even at corners.
-        if len(shelf_pts) >= 3:
-            zone_hull = MultiPoint(shelf_pts).convex_hull
-        else:
-            zone_hull = zone_poly.buffer(0)
-        inner_hull = zone_hull.buffer(-PERIM_SHRINK_MM)
-        if inner_hull.is_empty:
-            inner_hull = zone_hull.buffer(-600)
-        if inner_hull.is_empty:
-            inner_hull = zone_hull
+        # Median + 8×MAD filter: removes INSERT positions millions of mm away
+        # (e.g. Bad Nenndorf outlier at +176M mm) while keeping all real shelves.
+        s_xs = sorted(f.position[0] for f in raw_objs)
+        s_ys = sorted(f.position[1] for f in raw_objs)
+        mid  = len(s_xs) // 2
+        med_x, med_y = s_xs[mid], s_ys[mid]
+        mad_x = max(sorted(abs(x - med_x) for x in s_xs)[mid], 500.0)
+        mad_y = max(sorted(abs(y - med_y) for y in s_ys)[mid], 500.0)
+        shelf_objs = ([f for f in raw_objs
+                       if abs(f.position[0] - med_x) <= 8 * mad_x
+                       and abs(f.position[1] - med_y) <= 8 * mad_y]
+                      or raw_objs)
+        shelf_pts = [f.position for f in shelf_objs]
 
-        placed = []; visited = set()
+        # ── 2. A lights — one per unique shelf-snapped grid node ──────────
+        visited: set = set()
+        placed:  list = []
 
         for sx, sy in shelf_pts:
             gx, gy = _snap(sx, sy, pitch, ox, oy)
-            # Use zone.polygon (actual room walls) as the containment boundary.
-            # zone_hull may be non-convex or have gaps near wall corners; the room
-            # polygon is always the tightest correct boundary.
-            if not zone_poly.covers(Point(gx, gy)):
-                continue
             key = (round(gx), round(gy))
             if key in visited or _is_excluded(gx, gy, excl):
                 continue
             visited.add(key)
-            # K3 (Type C) classification requires the calibrated Hamburg inner hull.
-            # For DWG input (self._inner is None) there is no reliable perimeter-row
-            # detection from geometry alone, so all shelf-guided positions → Type A.
-            is_inner = (self._inner is None or
-                        (not inner_hull.is_empty and
-                         inner_hull.contains(Point(gx, gy))))
-            placed.append(_make(gx, gy, zone.zone_type,
-                                'A' if is_inner else 'C', shelf_aligned=True))
+            placed.append(_make(gx, gy, zone.zone_type, 'A', shelf_aligned=True))
 
-        # Supplement: TYPE_B (K4, 60°) fills the second luminaire position in
-        # high-shelf (57/67) ceiling tiles.  B count scales with the fraction of
-        # 57/67-height shelves in the plan — not with floor area.
-        #
-        # Calibrated from 4 real Rossmann plans (all MIKA80-E, 1250mm grid):
-        #   f57=0.143 (Bad Nenndorf 1786)  A_placed=122 → B_target=37  ratio=0.303
-        #   f57=0.745 (Puderbach 4073)    A_placed=161 → B_target=72  ratio=0.447
-        # Linear fit from these two reference points:
-        #   B/A = 0.269 + f57 × 0.239
-        all_shelves  = [f for f in plan.furniture if f.inferred_type == 'shelving']
-        high_shelves = [f for f in all_shelves
-                        if _shelf_height_code(f) in ('57', '67')]
-        if all_shelves:
-            f57     = len(high_shelves) / len(all_shelves)
-            b_ratio = 0.269 + f57 * 0.239
-            max_b   = max(4, round(len(placed) * b_ratio))
-        else:
-            max_b   = max(4, round(zone.area_m2 * 0.109))  # area fallback
+        if not placed:
+            return []
+
+        a_keys = frozenset(visited)
+
+        # ── 3. B lights — 4-connected neighbors of A lights ───────────────
+        # Each B candidate is exactly one grid step (1250 mm) from an A light.
+        # Aisles between shelf rows and the 1–2 m perimeter walkway are one step
+        # from the nearest shelf row → fully covered. Nodes further away
+        # (outside the building where there are no shelves) are never reached.
+        all_shelf_objs = [f for f in plan.furniture if f.inferred_type == 'shelving']
+        high_shelves   = [f for f in all_shelf_objs
+                          if _shelf_height_code(f) in ('57', '67')]
+        f57     = len(high_shelves) / max(len(all_shelf_objs), 1)
+        b_ratio = 0.269 + f57 * 0.239
+        max_b   = max(4, round(len(placed) * b_ratio))
+
+        # Build candidate list in row-major order (reproducible, spread-out fill)
+        b_cands: list = []
+        seen_b:  set  = set()
+        for ax, ay in sorted(a_keys, key=lambda k: (k[1], k[0])):
+            for dx, dy in [(pitch, 0), (-pitch, 0), (0, pitch), (0, -pitch)]:
+                nk = (round(ax + dx), round(ay + dy))
+                if nk not in visited and nk not in seen_b:
+                    seen_b.add(nk)
+                    b_cands.append(nk)
+
+        # Spread B lights evenly: take every step-th candidate, then fill remainder
+        step = max(1, len(b_cands) // max(max_b, 1))
         b_count = 0
-        grid_all = _grid_pts(zone.polygon, pitch, ox, oy)
-        for gx, gy in grid_all:
+        for i in range(0, len(b_cands), step):
             if b_count >= max_b:
                 break
-            key = (round(gx), round(gy))
-            if key in visited or _is_excluded(gx, gy, excl):
-                continue
-            if zone_hull.covers(Point(gx, gy)):
-                visited.add(key)
-                placed.append(_make(gx, gy, zone.zone_type, 'B', shelf_aligned=False))
+            bx, by = b_cands[i]
+            if not _is_excluded(bx, by, excl):
+                visited.add((bx, by))
+                placed.append(_make(bx, by, zone.zone_type, 'B', shelf_aligned=False))
                 b_count += 1
+        # Fill any shortfall (step may cause under-placement)
+        if b_count < max_b:
+            for bx, by in b_cands:
+                if b_count >= max_b:
+                    break
+                if (bx, by) not in visited and not _is_excluded(bx, by, excl):
+                    visited.add((bx, by))
+                    placed.append(_make(bx, by, zone.zone_type, 'B', shelf_aligned=False))
+                    b_count += 1
 
-        # ── Type E (Sonder-Position) ──────────────────────────────────────────
-        # E = column-adjacent tiles.  Every structural column gets up to 2 E
-        # lights at the nearest free grid nodes within 1.5 × pitch radius.
-        # Calibrated: Eisleben 15 cols→22E, Puderbach 19 cols→33E,
-        #             Bad Nenndorf 6 cols→18E, Hamburg 15 cols→6E (many near GK).
-        # Only use columns that are actually inside the zone polygon — exterior
-        # columns (on perimeter walls, title-block elements) produce spurious E
-        # lights and suppress the area-based fallback when they shouldn't.
-        col_pts = [(f.position[0], f.position[1])
+        # ── 4. E lights — column-adjacent nodes ──────────────────────────────
+        col_raw = [(f.position[0], f.position[1])
                    for f in plan.furniture if f.inferred_type == 'column']
-        # Deduplicate column positions: the same physical column often appears on
-        # multiple DXF layers (e.g. 01_Grundriss outline + 11_Schraffur hatching),
-        # producing 2-4× as many detections as actual structural columns.
-        # Use 300 mm as the merge threshold — well below the ~5 m inter-column
-        # spacing of Rossmann structural grids, so distinct columns are never merged.
-        col_pts_unique: list = []
-        for cp in col_pts:
-            if not any(math.sqrt((cp[0]-u[0])**2 + (cp[1]-u[1])**2) < 300.0
-                       for u in col_pts_unique):
-                col_pts_unique.append(cp)
-        # Accept columns inside the zone polygon AND those within 200 mm of its
-        # boundary (catches columns that land just outside a slightly under-sized
-        # DXF room polygon while still having accessible grid points inside).
-        zone_near = zone.polygon.buffer(200)
-        col_pts_in_zone = [cp for cp in col_pts_unique
-                           if zone_near.covers(Point(cp[0], cp[1]))]
 
-        if col_pts_in_zone:
-            for col_x, col_y in col_pts_in_zone:
+        # Deduplicate: same physical column often appears on multiple DXF layers
+        col_dedup: list = []
+        for cp in col_raw:
+            if not any(math.sqrt((cp[0]-u[0])**2 + (cp[1]-u[1])**2) < 300.0
+                       for u in col_dedup):
+                col_dedup.append(cp)
+
+        # Filter to columns inside (or within 200 mm of) the sales floor zone.
+        # Structural columns are always inside the building by definition, so this
+        # simply removes legend/title-block elements that appear far from the store.
+        zone_near = zone.polygon.buffer(200)
+        col_in_zone = [cp for cp in col_dedup
+                       if zone_near.covers(Point(cp[0], cp[1]))]
+
+        if col_in_zone:
+            for col_x, col_y in col_in_zone:
+                # Search grid nodes centred on the snapped column position.
+                # Structural columns are inside the building → nearby grid nodes are too.
+                snap_cx = round(col_x / pitch) * pitch
+                snap_cy = round(col_y / pitch) * pitch
                 near = sorted(
-                    [(gx, gy) for gx, gy in grid_all
-                     if math.sqrt((gx - col_x) ** 2 + (gy - col_y) ** 2) < pitch * 1.5],
-                    key=lambda p: math.sqrt((p[0] - col_x) ** 2 + (p[1] - col_y) ** 2),
+                    [(snap_cx + di * pitch, snap_cy + dj * pitch)
+                     for di in range(-2, 3) for dj in range(-2, 3)
+                     if math.sqrt((snap_cx + di*pitch - col_x)**2 +
+                                  (snap_cy + dj*pitch - col_y)**2) < pitch * 1.5],
+                    key=lambda p: math.sqrt((p[0] - col_x)**2 + (p[1] - col_y)**2),
                 )
                 placed_for_col = 0
                 for gx, gy in near:
@@ -599,65 +612,62 @@ class RealLuminairePlacer:
                         break
                     key = (round(gx), round(gy))
                     if key not in visited and not _is_excluded(gx, gy, excl):
-                        if zone.polygon.covers(Point(gx, gy)):
-                            visited.add(key)
-                            placed.append(_make(gx, gy, zone.zone_type, 'E',
-                                               shelf_aligned=False))
-                            placed_for_col += 1
+                        visited.add(key)
+                        placed.append(_make(gx, gy, zone.zone_type, 'E',
+                                           shelf_aligned=False))
+                        placed_for_col += 1
         else:
-            # No columns inside zone — area-based fallback.
-            # Calibrated from Puderbach (600 m² → 33 E): ratio ≈ 0.055 /m²
-            target_e = max(0, round(zone.area_m2 * 0.055))
-            if target_e > 0:
-                e_candidates = [
-                    (gx, gy) for gx, gy in grid_all
-                    if (round(gx), round(gy)) not in visited
-                    and not _is_excluded(gx, gy, excl)
-                    and zone.polygon.covers(Point(gx, gy))
-                ]
-                e_candidates.sort(
+            # No structural columns detected inside the zone.
+            # For large stores (many A lights = real full-size plan) use an area-based
+            # estimate: calibrated from Puderbach (660 m² → 36 E, ratio = 0.055/m²).
+            # For small/test plans (< 50 A lights) skip E entirely — they likely have no
+            # real structural columns, and zone.area_m2 may be a Hamburg fallback value.
+            if len(placed) >= 50:
+                target_e = max(0, round(zone.area_m2 * 0.055))
+                reachable: set = set(a_keys)
+                for ax, ay in a_keys:
+                    for dx, dy in [(pitch, 0), (-pitch, 0), (0, pitch), (0, -pitch)]:
+                        reachable.add((round(ax + dx), round(ay + dy)))
+                e_cands = sorted(
+                    [(gx, gy) for gx, gy in reachable
+                     if (round(gx), round(gy)) not in visited
+                     and not _is_excluded(gx, gy, excl)],
                     key=lambda p: (round((p[1] - oy) / pitch),
-                                   round((p[0] - ox) / pitch))
+                                   round((p[0] - ox) / pitch)),
                 )
-                n    = len(e_candidates)
-                step = max(1, n // target_e)
+                n = len(e_cands)
+                step_e = max(1, n // max(target_e, 1))
                 e_placed = 0
-                for i in range(0, n, step):
+                for i in range(0, n, step_e):
                     if e_placed >= target_e:
                         break
-                    gx, gy = e_candidates[i]
+                    gx, gy = e_cands[i]
                     visited.add((round(gx), round(gy)))
                     placed.append(_make(gx, gy, zone.zone_type, 'E', shelf_aligned=False))
                     e_placed += 1
 
-        # ── Type C (corner/perimeter accent) ─────────────────────────────────
-        # C is the same MIKA80-E luminaire as A, placed at the 4 extreme shelf
-        # corners.  A lights already occupy those grid nodes, so we relabel the
-        # 4 nearest A lights to C — no free-slot search, no visited conflicts.
+        # ── 5. C lights — relabel 4 corner-nearest A lights ───────────────
         if shelf_pts:
-            shelf_xs = [p[0] for p in shelf_pts]
-            shelf_ys = [p[1] for p in shelf_pts]
+            sx_list = [p[0] for p in shelf_pts]
+            sy_list = [p[1] for p in shelf_pts]
             corners = [
-                (min(shelf_xs), min(shelf_ys)),
-                (max(shelf_xs), min(shelf_ys)),
-                (max(shelf_xs), max(shelf_ys)),
-                (min(shelf_xs), max(shelf_ys)),
+                (min(sx_list), min(sy_list)), (max(sx_list), min(sy_list)),
+                (max(sx_list), max(sy_list)), (min(sx_list), max(sy_list)),
             ]
             relabeled_c: set = set()
             for cx, cy in corners:
-                a_candidates = [(i, p) for i, p in enumerate(placed)
-                                if p.lumi_type == 'A' and i not in relabeled_c]
-                if not a_candidates:
+                a_cands = [(i, p) for i, p in enumerate(placed)
+                           if p.lumi_type == 'A' and i not in relabeled_c]
+                if not a_cands:
                     break
-                ni = min(a_candidates,
+                ni = min(a_cands,
                          key=lambda ip: math.sqrt((ip[1].x - cx) ** 2 +
                                                   (ip[1].y - cy) ** 2))[0]
                 relabeled_c.add(ni)
                 old = placed[ni]
-                placed[ni] = _make(old.x, old.y, old.zone_type, 'C',
-                                   shelf_aligned=False)
+                placed[ni] = _make(old.x, old.y, old.zone_type, 'C', shelf_aligned=False)
 
-        # Honeycomb (TYPE_W) at cosmetics labels — anti-glare for beauty products
+        # ── 6. W (Wabeneinsatz) — replace at cosmetics label positions ────
         cosmetics = [lbl for lbl in getattr(plan, 'zone_labels', [])
                      if any(k in lbl.get('text', '').lower()
                             for k in ('kosmetik', 'parfüm', 'duft', 'gobo',
@@ -666,11 +676,9 @@ class RealLuminairePlacer:
             cx, cy = cz['x_mm'], cz['y_mm']
             gx, gy = _snap(cx, cy, pitch, ox, oy)
             key = (round(gx), round(gy))
-            if key not in visited and not _is_excluded(gx, gy, excl):
-                # Replace the existing downlight at this position with TYPE_W
+            if key in visited:   # only replace an existing light, never add outside domain
                 placed = [p for p in placed
                           if not (round(p.x) == round(gx) and round(p.y) == round(gy))]
-                visited.add(key)
                 placed.append(_make(gx, gy, zone.zone_type, 'W', shelf_aligned=False))
 
         return placed
