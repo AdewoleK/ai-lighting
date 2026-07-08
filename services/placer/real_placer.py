@@ -365,8 +365,9 @@ class RealLuminairePlacer:
         base_pitch = int(getattr(plan, 'grid_pitch_mm', PITCH_MM) or PITCH_MM)
         ceiling_mm = int(getattr(plan, 'ceiling_height_mm', 3000) or 3000)
 
-        result = PlacementResult(source_file=plan.source_file)
-        excl   = getattr(plan, 'exclusion_zones', [])
+        result   = PlacementResult(source_file=plan.source_file)
+        excl     = getattr(plan, 'exclusion_zones', [])
+        envelope = getattr(plan, 'building_envelope', None)
 
         for zone in classified.zones:
             zt = zone.zone_type
@@ -406,8 +407,15 @@ class RealLuminairePlacer:
                 # Mis-detection guard: if the checkout zone centroid is > 20 m from the
                 # nearest shelf position, it was likely detected from a legend / detail
                 # block drawn far from the actual store footprint.  Skip it silently.
+                # Use envelope-filtered shelf positions so phantom TEXT shelves in the
+                # title block cannot act as false anchors near a misdetected checkout zone.
                 shelf_positions = [f.position for f in plan.furniture
                                    if f.inferred_type == 'shelving']
+                if envelope is not None:
+                    _ep = envelope.buffer(2000)
+                    _sp = [p for p in shelf_positions if _ep.covers(Point(*p))]
+                    if _sp:
+                        shelf_positions = _sp
                 if shelf_positions:
                     from shapely.geometry import MultiPoint as _MP
                     nearest_shelf_dist = zone.polygon.centroid.distance(
@@ -451,12 +459,30 @@ class RealLuminairePlacer:
                 luminaire_flux_lm  = spec.luminaire_flux_lm,
             ))
 
-        # Hard boundary filter removed: shelf-anchored placement guarantees that
-        # every sales floor light is derived from a detected shelf position, so it
-        # cannot escape outside the building.  Checkout zone mis-detection is handled
-        # by the proximity guard above (> 20 m from nearest shelf → skip).
-        # Non-sales zones (checkout grid, storage rows) use the zone polygon directly
-        # so their lights are already contained by construction.
+        # ── Building-envelope boundary guard ─────────────────────────────────
+        # Use the ACTUAL building wall polygon (pre-computed in the parser from
+        # room polylines) as the hard outer limit.  Unlike the old zone-polygon
+        # union (which could bleed through walls), the building envelope is the
+        # literal store footprint.  A 2 m buffer tolerates grid-snap rounding at
+        # the wall edge.
+        #
+        # Checkout zones live in the entrance vestibule, which is attached to the
+        # building but outside the main sales-floor envelope polygon.  Add them to
+        # the valid area explicitly so their D-lights pass the guard.
+        if envelope is not None:
+            from shapely.ops import unary_union as _uu
+            _guard_polys = [envelope.buffer(2000)]
+            for _z in classified.zones:
+                if _z.zone_type == 'checkout_zone':
+                    _guard_polys.append(_z.polygon.buffer(500))
+            _env_guard = _uu(_guard_polys)
+            before = len(result.placed)
+            result.placed = [l for l in result.placed
+                             if _env_guard.covers(Point(l.x, l.y))]
+            clipped = before - len(result.placed)
+            if clipped > 0:
+                result.corrections.append(
+                    f"Envelope guard removed {clipped} lights outside building boundary")
 
         return result
 
@@ -500,6 +526,17 @@ class RealLuminairePlacer:
         raw_objs = [f for f in plan.furniture if f.inferred_type == 'shelving']
         if not raw_objs:
             return self._place_grid_default(zone, excl, pitch, ox, oy)
+
+        # Primary filter: building envelope clips out TEXT shelf labels from
+        # title-block legends drawn at the DWG origin.  The parser already does
+        # this (see dwg_parser.py post-processing), but apply it here too as a
+        # belt-and-suspenders for PDF input and other code paths.
+        _env = getattr(plan, 'building_envelope', None)
+        if _env is not None:
+            _env_buf = _env.buffer(2000)
+            _in_env  = [f for f in raw_objs if _env_buf.covers(Point(*f.position))]
+            if _in_env:
+                raw_objs = _in_env
 
         # Median + 8×MAD filter: removes INSERT positions millions of mm away
         # (e.g. Bad Nenndorf outlier at +176M mm) while keeping all real shelves.

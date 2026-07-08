@@ -435,6 +435,21 @@ class DWGParser:
         plan.building_envelope = self._find_building_envelope(plan.room_polygons, plan.furniture)
         plan.exclusion_zones = exclusion_polys
 
+        # ── Purge out-of-building shelf furniture ──────────────────────────
+        # TEXT entities with shelf height codes ("57", "47", …) appear in
+        # Rossmann title-block legend tables drawn at or near the DWG origin,
+        # far from the actual store.  Remove any shelving furniture whose
+        # position falls outside the building envelope so these phantom anchors
+        # never reach the classifier or the placer.
+        if plan.building_envelope is not None:
+            from shapely.geometry import Point as _Pt
+            _env = plan.building_envelope.buffer(2000)   # 2 m tolerance for wall-edge items
+            plan.furniture = [
+                f for f in plan.furniture
+                if f.inferred_type != 'shelving'
+                or _env.covers(_Pt(f.position))
+            ]
+
         # ── Ceiling grid origin & pitch ────────────────────────────────────
         if plan.grid_lines:
             plan.grid_origin_mm, plan.grid_pitch_mm = \

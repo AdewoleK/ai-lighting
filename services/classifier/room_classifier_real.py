@@ -117,7 +117,16 @@ def _label_zones(plan: ParsedPlan) -> list:
     # ── Sales floor polygon ───────────────────────────────────────────────────
     # Use convex hull of all detected shelf positions (works for both PDF and DWG
     # input, since shelf INSERT blocks are reliably recognised across file types).
-    shelf_pts = [f.position for f in plan.furniture if f.inferred_type == 'shelving']
+    # Filter to shelves inside (or within 2 m of) the building envelope so that
+    # legend-table TEXT annotations at the DWG origin don't inflate the hull.
+    _shelf_all = [f.position for f in plan.furniture if f.inferred_type == 'shelving']
+    _envelope  = getattr(plan, 'building_envelope', None)
+    if _envelope is not None:
+        _env_buf   = _envelope.buffer(2000)
+        _shelf_env = [p for p in _shelf_all if _env_buf.covers(Point(*p))]
+        shelf_pts  = _shelf_env if _shelf_env else _shelf_all
+    else:
+        shelf_pts = _shelf_all
 
     # Get area from labelled zones first; fall back to spatial search in annotations.
     sf_labels = [l for l in plan.zone_labels
