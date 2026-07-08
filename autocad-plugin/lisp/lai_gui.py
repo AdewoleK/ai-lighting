@@ -191,6 +191,35 @@ def _edit_custom_desc(old: str, new: str) -> None:
         pass
 
 
+# ── Presets persistence ──────────────────────────────────────────────────────
+_PRESETS_FILE = pathlib.Path.home() / "ai-lighting" / "lightingai_presets.json"
+_MAX_PRESETS  = 3
+
+
+def _load_presets() -> list:
+    """Return saved presets (up to _MAX_PRESETS)."""
+    try:
+        if _PRESETS_FILE.exists():
+            data = json.loads(_PRESETS_FILE.read_text(encoding='utf-8'))
+            if isinstance(data, list):
+                return data[:_MAX_PRESETS]
+    except Exception:
+        pass
+    return []
+
+
+def _write_presets(presets: list) -> None:
+    """Persist the presets list to disk."""
+    try:
+        _PRESETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _PRESETS_FILE.write_text(
+            json.dumps(presets[:_MAX_PRESETS], ensure_ascii=False, indent=2),
+            encoding='utf-8'
+        )
+    except Exception:
+        pass
+
+
 # AutoCAD lineweight enum values (hundredths of mm)
 # Each tuple: (acad_lw_int, label, mm_string, preview_px)
 _PRESET_LINEWEIGHTS = [
@@ -459,6 +488,197 @@ def open_config_dialog():
              font=('Helvetica', 13, 'bold'),
              bg='#181c24', fg='#e0e6f0',
              padx=16, pady=12, anchor='w').pack(side='left')
+    tk.Frame(dlg, bg='#252c3a', height=1).pack(fill='x')
+
+    # ── Presets strip ────────────────────────────────────────────────────────
+    ps_outer = tk.Frame(dlg, bg='#0d1117')
+    ps_outer.pack(fill='x')
+
+    ps_hdr = tk.Frame(ps_outer, bg='#0d1117')
+    ps_hdr.pack(fill='x', padx=16, pady=(10, 4))
+    tk.Label(ps_hdr, text="MY PRESETS",
+             font=('Helvetica', 10, 'bold'), bg='#0d1117', fg='#8892a4').pack(side='left')
+    tk.Label(ps_hdr, text="Save your full setup and reload it in one click",
+             font=('Helvetica', 8), bg='#0d1117', fg='#3a4254').pack(side='left', padx=(8, 0))
+
+    ps_cards_row = tk.Frame(ps_outer, bg='#0d1117')
+    ps_cards_row.pack(fill='x', padx=16, pady=(0, 10))
+
+    # — Preset helpers (forward-reference rebuild_tabs via closure — called at click time) ——
+
+    def _prompt_save_preset():
+        existing = _load_presets()
+        if len(existing) >= _MAX_PRESETS:
+            from tkinter import messagebox
+            messagebox.showwarning(
+                "Presets Full",
+                f"You already have {_MAX_PRESETS} presets saved.\n"
+                "Delete one to make room for a new one.",
+                parent=dlg
+            )
+            return
+
+        prompt = tk.Toplevel(dlg)
+        prompt.title("Save Preset")
+        prompt.configure(bg='#111419')
+        prompt.resizable(False, False)
+        prompt.grab_set()
+        prompt.attributes('-topmost', True)
+
+        tk.Label(prompt, text="Give this preset a name:",
+                 font=('Helvetica', 12), bg='#111419', fg='#c0cce0').pack(
+                     padx=24, pady=(18, 6), anchor='w')
+
+        name_var = tk.StringVar()
+        name_ent = tk.Entry(prompt, textvariable=name_var,
+                            font=('Helvetica', 12),
+                            bg='#0d1117', fg='#e8eeff',
+                            insertbackground='#e040fb',
+                            relief='flat', bd=0,
+                            highlightthickness=2,
+                            highlightbackground='#2a3248',
+                            highlightcolor='#e040fb')
+        name_ent.pack(fill='x', padx=24, ipady=8)
+        name_ent.focus_set()
+
+        def _do_save():
+            name = name_var.get().strip()
+            if not name:
+                return
+            n = num_types.get()
+            config = [
+                {"type":        chr(65 + i),
+                 "shape":       selections[i]['shape'],
+                 "color":       selections[i]['color'],
+                 "description": selections[i].get('description', '').strip()}
+                for i in range(n)
+            ]
+            saved = _load_presets()
+            saved.append({"name": name, "num_types": n, "config": config})
+            _write_presets(saved)
+            _rebuild_preset_strip()
+            prompt.destroy()
+
+        br = tk.Frame(prompt, bg='#111419')
+        br.pack(fill='x', padx=24, pady=14)
+        tk.Button(br, text="Save",
+                  font=('Helvetica', 11, 'bold'),
+                  bg='#e040fb', fg='#111419',
+                  activebackground='#c020d0', activeforeground='#111419',
+                  relief='flat', padx=16, pady=6, cursor='hand2',
+                  command=_do_save).pack(side='right', padx=(6, 0))
+        tk.Button(br, text="Cancel",
+                  font=('Helvetica', 11),
+                  bg='#1e2330', fg='#8892a4',
+                  relief='flat', padx=16, pady=6, cursor='hand2',
+                  command=prompt.destroy).pack(side='right')
+
+        name_ent.bind('<Return>', lambda e: _do_save())
+        name_ent.bind('<Escape>', lambda e: prompt.destroy())
+
+        prompt.update_idletasks()
+        px = dlg.winfo_rootx() + (dlg.winfo_width()  - prompt.winfo_reqwidth())  // 2
+        py = dlg.winfo_rooty() + (dlg.winfo_height() - prompt.winfo_reqheight()) // 2
+        prompt.geometry(f"+{max(0, px)}+{max(0, py)}")
+
+    def _apply_preset(preset):
+        n = min(max(1, preset.get('num_types', 5)), 6)
+        num_types.set(n)
+        for entry in preset.get('config', []):
+            idx = ord(entry.get('type', 'A')) - 65
+            if 0 <= idx < 6:
+                selections[idx]['shape']       = entry.get('shape',       SHAPE_DEFAULTS[idx])
+                selections[idx]['color']       = entry.get('color',       COLOR_DEFAULTS[idx])
+                selections[idx]['description'] = entry.get('description', '')
+        rebuild_tabs()   # resolved at call time — defined later in the same closure
+
+    def _delete_preset_at(slot_idx):
+        presets = _load_presets()
+        if 0 <= slot_idx < len(presets):
+            presets.pop(slot_idx)
+            _write_presets(presets)
+        _rebuild_preset_strip()
+
+    def _rebuild_preset_strip():
+        for w in ps_cards_row.winfo_children():
+            w.destroy()
+        presets = _load_presets()
+
+        for slot in range(_MAX_PRESETS):
+            is_filled = slot < len(presets)
+            card = tk.Frame(ps_cards_row,
+                            bg='#141820' if is_filled else '#0b0d14',
+                            highlightthickness=1,
+                            highlightbackground='#252c3a' if is_filled else '#181e28')
+            card.pack(side='left', fill='both', expand=True,
+                      padx=(0, 4 if slot < _MAX_PRESETS - 1 else 0))
+
+            if is_filled:
+                preset = presets[slot]
+                name   = preset.get('name', f'Preset {slot + 1}')
+                cfg    = preset.get('config', [])
+                n_t    = preset.get('num_types', len(cfg))
+
+                # Name
+                tk.Label(card,
+                         text=(name[:15] + '…') if len(name) > 15 else name,
+                         font=('Helvetica', 10, 'bold'), bg='#141820', fg='#e0e6f0',
+                         anchor='w').pack(fill='x', padx=8, pady=(8, 2))
+
+                # Mini shape/colour preview
+                dots = tk.Frame(card, bg='#141820')
+                dots.pack(fill='x', padx=8, pady=(0, 2))
+                for pe in cfg[:5]:
+                    chex = COLOR_HEX.get(pe.get('color', 'Blue'), '#4488ff')
+                    dc   = tk.Canvas(dots, width=13, height=13,
+                                     bg='#141820', highlightthickness=0)
+                    dc.pack(side='left', padx=1)
+                    draw_shape(dc, pe.get('shape', 'Circle'), chex, size=13)
+
+                tk.Label(card,
+                         text=f"{n_t} type{'s' if n_t != 1 else ''}",
+                         font=('Helvetica', 8), bg='#141820', fg='#5c6680').pack(
+                             anchor='w', padx=8, pady=(0, 4))
+
+                # Apply / Delete row
+                br = tk.Frame(card, bg='#141820')
+                br.pack(fill='x', padx=6, pady=(0, 8))
+
+                def _make_apply_cmd(p=preset):
+                    return lambda: _apply_preset(p)
+
+                def _make_delete_cmd(s=slot):
+                    return lambda: _delete_preset_at(s)
+
+                tk.Button(br, text="Apply",
+                          font=('Helvetica', 9, 'bold'),
+                          bg='#e040fb', fg='#111419',
+                          activebackground='#c020d0', activeforeground='#111419',
+                          relief='flat', padx=4, pady=3, cursor='hand2',
+                          command=_make_apply_cmd()).pack(
+                              side='left', fill='x', expand=True, padx=(0, 2))
+                tk.Button(br, text="✕",
+                          font=('Helvetica', 9, 'bold'),
+                          bg='#1a1520', fg='#ff5c7a',
+                          activebackground='#2a1020', activeforeground='#ff8090',
+                          relief='flat', padx=8, pady=3, cursor='hand2',
+                          command=_make_delete_cmd()).pack(side='left')
+
+            else:
+                # Empty slot
+                tk.Label(card, text="—\nopen slot",
+                         font=('Helvetica', 9), bg='#0b0d14', fg='#1e2330',
+                         justify='center').pack(expand=True, pady=20)
+
+    # Save button (packed after helpers are defined so command is valid)
+    tk.Button(ps_hdr, text="＋  Save current as preset",
+              font=('Helvetica', 9, 'bold'), bg='#1a2236', fg='#e040fb',
+              activebackground='#252c3a', activeforeground='#ff70ff',
+              relief='flat', padx=8, pady=3, cursor='hand2',
+              command=_prompt_save_preset).pack(side='right')
+
+    _rebuild_preset_strip()
+
     tk.Frame(dlg, bg='#252c3a', height=1).pack(fill='x')
 
     # ── Number of types ──────────────────────────────────────────────────────

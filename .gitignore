@@ -85,6 +85,7 @@ lightingai_pitch.json
 lightingai_grid_config.json
 lightingai_summary.json
 lightingai_custom_descs.json
+lightingai_presets.json
 
 # AutoCAD command scratch file — not part of source
 command.txt
