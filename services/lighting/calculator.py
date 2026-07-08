@@ -54,11 +54,13 @@ TARGET_LUX: dict[str, int] = {
 #   Separate scope: WC (IP65 wet-room fixtures), technical (utility fixtures)
 
 NO_LIGHTING_ZONE_TYPES: frozenset = frozenset({
-    'windfang',    # entrance vestibule — "Direkte Beleuchtung nicht möglich"
-    'escalator',   # escalator shaft — structural exclusion (Rolltreppe)
-    'elevator',    # elevator cabin — has own integrated lighting (Aufzug)
-    'wc',          # restrooms — IP65 wet-room fixtures, separate scope
-    'technical',   # utility/technical rooms — different fixture type
+    'windfang',      # entrance vestibule — "Direkte Beleuchtung nicht möglich"
+    'escalator',     # escalator shaft — structural exclusion (Rolltreppe)
+    'elevator',      # elevator cabin — has own integrated lighting (Aufzug)
+    'wc',            # restrooms — IP65 wet-room fixtures, separate scope
+    'technical',     # utility/technical rooms — different fixture type
+    'service_area',  # back-of-house counters — non-MIKA80 fixtures, separate scope
+    'office',        # back-of-house office — non-MIKA80 fixtures, separate scope
 })
 
 # ── Rossmann standard constants ───────────────────────────────────────────────

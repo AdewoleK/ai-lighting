@@ -103,6 +103,9 @@ class ParsedPlan:
     # Shapely Polygons for areas where luminaire placement is forbidden
     # (escalators, lifts, structural voids, areas annotated as impossible)
     exclusion_zones:   list  = field(default_factory=list)
+    # True when "Deckenraster anpassen" is annotated in the plan — placer
+    # skips D-light grid-fill and uses only detected furniture positions.
+    checkout_grid_adjusted: bool = False
 
     def summary(self) -> str:
         return (f"ParsedPlan({Path(self.source_file).name}): "
@@ -130,8 +133,10 @@ LABEL_MAP = {
     'verkaufsraum':'sales_floor','verkauf':'sales_floor','vkf':'sales_floor',
     # Storage
     'lager':'storage','zbv':'storage','lagerraum':'storage',
-    # Checkout
+    # Checkout — standard and abbreviated forms used across Rossmann DXF variants
     'kasse':'checkout_zone','kassen':'checkout_zone','sb-kasse':'checkout_zone',
+    'hauptkasse':'checkout_zone','hk':'checkout_zone','kassenzone':'checkout_zone',
+    'kassenbereich':'checkout_zone','kassenplatz':'checkout_zone',
     # Circulation
     'flur':'corridor','eingang':'entrance','treppenraum':'corridor',
     # Display window — NEO85-SX track spotlights
@@ -218,10 +223,15 @@ class PDFFloorPlanParser:
             if zt != 'unknown' or a:
                 plan.zone_labels.append({'text':text[:80],'zone_type':zt,
                                          'area_m2':a,'x_mm':cx,'y_mm':cy})
+            # Detect "Deckenraster anpassen" — ceiling grid must be adjusted
+            # in checkout area; placer will skip D-light grid-fill.
+            if 'deckenraster anpassen' in text.lower():
+                plan.checkout_grid_adjusted = True
 
         paths = page.get_drawings()
-        plan.room_polygons = self._rooms(paths, p2mm, scale)
-        plan.shelf_runs    = self._shelf_runs(paths, p2mm, scale)
+        plan.room_polygons  = self._rooms(paths, p2mm, scale)
+        plan.shelf_runs     = self._shelf_runs(paths, p2mm, scale)
+        plan.furniture     += self._columns(paths, p2mm, scale)
 
         # Detect grid origin from "Startmaß Rasterdecke" annotations or
         # from the first grid line intersection found in the drawings
@@ -333,6 +343,36 @@ class PDFFloorPlanParser:
                 cx,cy=p2mm((r.x0+r.x1)/2,(r.y0+r.y1)/2)
                 runs.append({'x_mm':cx,'y_mm':cy,'width_mm':wmm,'height_mm':hmm,'orientation':'V'})
         return runs
+
+    def _columns(self, paths, p2mm, scale):
+        """
+        Detect structural columns from small, roughly-square closed paths.
+
+        Rossmann columns range from ~225×225mm (Ø 405mm circular in Hamburg)
+        to ~650×500mm (rectangular in suburban stores).  In PDF rendering they
+        appear as small filled/stroked rectangles distinct from shelf graphics
+        (shelves are long and narrow: aspect ratio > 4:1).
+        """
+        cols = []
+        seen = set()
+        for path in paths:
+            r   = path['rect']
+            wmm = r.width  * (25.4 / 72) * scale
+            hmm = r.height * (25.4 / 72) * scale
+            area = wmm * hmm
+            if not (22_500 < area < 500_000):   # 150×150mm → 700×700mm
+                continue
+            aspect = wmm / max(hmm, 1)
+            if not (0.25 < aspect < 4.0):       # roughly square / circular
+                continue
+            cx, cy = p2mm((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+            key = (round(cx / 100), round(cy / 100))   # cluster within 100mm
+            if key in seen:
+                continue
+            seen.add(key)
+            cols.append(FurnitureInsert(
+                f"_COL_{len(cols)}", (cx, cy), 0.0, "COLUMN", "column"))
+        return cols
 
 
 # ── Luminaire extractor ───────────────────────────────────────────────────────

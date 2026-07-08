@@ -78,6 +78,12 @@ class ParsedPlan:
     zone_labels: list                       = field(default_factory=list)
     shelf_runs: list                        = field(default_factory=list)
     scale: str                              = "1:50"
+    # True when "Deckenraster anpassen" annotation found in checkout area —
+    # placer skips grid-fill for D lights and uses only furniture positions.
+    checkout_grid_adjusted: bool            = False
+    # Outer building envelope polygon — used by placer to clip placement to
+    # the floor plan boundary and prevent lights going outside walls.
+    building_envelope: Optional[Polygon]    = None
 
     def summary(self) -> str:
         return (
@@ -96,12 +102,15 @@ class ParsedPlan:
 
 BLOCK_TYPE_MAP: dict[str, str] = {
     # Checkout / POS
-    "checkout": "checkout", "pos": "checkout", "cashier": "checkout",
+    "checkout": "checkout", "cashier": "checkout",
     "kasse": "checkout", "kassenstuhl": "checkout", "kassentisch": "checkout",
     # Shelving / racks
     "shelf": "shelving", "shelving": "shelving", "rack": "shelving",
     "gondola": "shelving", "regal": "shelving", "ausstattung": "shelving",
     "tier": "shelving",
+    # Structural columns — trigger E (Sonder-Position) placement in placer
+    "saule": "column", "säule": "column", "stütze": "column",
+    "pfeiler": "column", "pillar": "column", "column": "column",
     # Service / office
     "desk": "desk", "counter": "desk", "service": "desk",
     "theke": "desk",
@@ -278,7 +287,7 @@ class DWGParser:
             cat   = entity_category(entity, self._layer_sets)
             layer_up = entity.dxf.layer.upper()
 
-            # ── Closed polylines → room boundaries or exclusions ──────────
+            # ── Closed polylines → room boundaries, exclusions, or columns ─
             if etype == "LWPOLYLINE":
                 poly = lwpolyline_to_polygon(entity)
                 if poly:
@@ -286,6 +295,28 @@ class DWGParser:
                         exclusion_polys.append(poly)
                     elif cat in ("walls", "other", "ceiling"):
                         raw_polys.append(poly)
+                        # Structural columns: closed polylines on column layers
+                        # OR large, nearly-square polylines (≥200×200mm, ≤700×700mm).
+                        # Require a column layer OR a large minimum area to avoid
+                        # misidentifying checkout counters, signage bases, etc.
+                        _col_layer = any(
+                            k in entity.dxf.layer.lower()
+                            for k in ('stütz', 'stuetz', 'stütze', 'säule',
+                                      'saule', 'column', 'pfeiler', 'pillar'))
+                        if 40_000 < poly.area < 500_000:
+                            b = poly.bounds
+                            w = b[2] - b[0]; h = b[3] - b[1]
+                            aspect = w / max(h, 1)
+                            # On a column layer: accept any nearly-square shape ≥200×200mm
+                            # Not on column layer: require ≥250×250mm AND nearly-square (tighter)
+                            min_area = 40_000 if _col_layer else 62_500
+                            max_aspect = 3.0 if _col_layer else 2.0
+                            if (poly.area >= min_area and
+                                    1 / max_aspect < aspect < max_aspect):
+                                plan.furniture.append(FurnitureInsert(
+                                    f"_COL_{len(plan.furniture)}",
+                                    (poly.centroid.x, poly.centroid.y),
+                                    0.0, entity.dxf.layer, 'column'))
 
             elif etype == "POLYLINE":
                 pts = [(v.dxf.location.x, v.dxf.location.y)
@@ -354,6 +385,23 @@ class DWGParser:
                 from services.parser.pdf_parser import (
                     _zone_from_label, _is_exclusion_label, SHELF_LABELS)
                 text_stripped = text.strip()
+                text_lower    = text_stripped.lower()
+
+                # Gap 6 — Startmaß / Referenzmaß Rasterdecke:
+                # The annotation that anchors the 1250mm ceiling grid to the
+                # building.  Its position IS the grid origin.  Only set when
+                # the DWG has no grid lines (grid_origin_mm still at default).
+                if (('startmaß' in text_lower or 'referenzmaß' in text_lower)
+                        and 'rasterdecke' in text_lower
+                        and plan.grid_origin_mm == (0.0, 0.0)):
+                    plan.grid_origin_mm = (round(pos[0]), round(pos[1]))
+
+                # Gap 3 — Deckenraster anpassen:
+                # Signals that the ceiling grid in the checkout area must be
+                # physically adjusted on site.  Placer will skip D-light
+                # grid-fill and use only the detected furniture positions.
+                if 'deckenraster anpassen' in text_lower:
+                    plan.checkout_grid_adjusted = True
                 if text_stripped in SHELF_LABELS:
                     plan.furniture.append(FurnitureInsert(
                         f"SHELF_{text_stripped}", pos, 0.0,
@@ -384,6 +432,7 @@ class DWGParser:
 
         # ── Deduplicate & filter room polygons ─────────────────────────────
         plan.room_polygons   = self._clean_polygons(raw_polys)
+        plan.building_envelope = self._find_building_envelope(plan.room_polygons, plan.furniture)
         plan.exclusion_zones = exclusion_polys
 
         # ── Ceiling grid origin & pitch ────────────────────────────────────
@@ -431,6 +480,46 @@ class DWGParser:
             if not dominated:
                 kept.append(poly)
         return kept
+
+    @staticmethod
+    def _find_building_envelope(room_polys: list, furniture: list) -> Optional[Polygon]:
+        """
+        Find the building outer-wall polygon from all detected closed polylines.
+
+        Uses furniture DENSITY (items per m²) as the primary score so that large
+        drawing-frame polygons (low density) lose to the actual store boundary
+        (high density), even though the frame contains 100% of the furniture.
+
+        Minimum requirement: covers ≥ 40% of known-type furniture items.
+        Among qualifying polygons, highest density wins (tightest real boundary).
+        """
+        from shapely.geometry import Point as _Point
+
+        furniture_pts = [_Point(f.position) for f in furniture
+                         if f.inferred_type not in ('unknown',)]
+        if not furniture_pts:
+            furniture_pts = [_Point(f.position) for f in furniture]
+        if not furniture_pts:
+            return None
+
+        candidates = []
+        for poly in room_polys:
+            area_m2 = poly.area / 1e6
+            if not (80 <= area_m2 <= 2000):
+                continue
+            n_inside = sum(1 for pt in furniture_pts if poly.covers(pt))
+            coverage = n_inside / len(furniture_pts)
+            if coverage < 0.40:          # must cover at least 40% of real furniture
+                continue
+            density = n_inside / area_m2  # items per m² — high = tight real boundary
+            candidates.append((density, area_m2, coverage, poly))
+
+        if not candidates:
+            return None
+
+        # Highest density first; break ties by smallest area (tightest fit)
+        candidates.sort(key=lambda x: (-x[0], x[1]))
+        return candidates[0][3]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

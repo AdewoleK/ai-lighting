@@ -66,6 +66,50 @@ def _spatial_area(lbl: dict, annotations: list, radius_mm: float = 3000.0) -> fl
     return 0.0
 
 
+def _find_room_poly_for_label(x_mm: float, y_mm: float, room_polys: list) -> Optional[Polygon]:
+    """
+    Given a zone label coordinate, return the DXF room polygon that CONTAINS it.
+    If none contains it, return the nearest polygon whose centroid is within 15 m.
+    Returns None if room_polys is empty.
+    """
+    if not room_polys:
+        return None
+    pt = Point(x_mm, y_mm)
+    # Primary: find polygon that directly contains the label position
+    for rp in room_polys:
+        if rp.covers(pt):
+            return rp
+    # Fallback: nearest polygon by centroid distance (within 15 000 mm = 15 m)
+    closest = min(room_polys, key=lambda p: pt.distance(p.centroid))
+    if pt.distance(closest.centroid) < 15_000:
+        return closest
+    return None
+
+
+def _clip_zone_to_envelope(zone_poly: Polygon, envelope: Optional[Polygon]) -> Polygon:
+    """
+    Clip a zone polygon to the building envelope.
+    If envelope is None or the intersection is empty/degenerate, return the original.
+    """
+    if envelope is None:
+        return zone_poly
+    try:
+        clipped = zone_poly.intersection(envelope)
+        if clipped.is_empty or clipped.area < 1_000:
+            return zone_poly
+        # intersection may return a GeometryCollection — extract largest polygon
+        if clipped.geom_type == 'GeometryCollection':
+            polys = [g for g in clipped.geoms if g.geom_type in ('Polygon', 'MultiPolygon')]
+            if not polys:
+                return zone_poly
+            clipped = max(polys, key=lambda g: g.area)
+        if clipped.geom_type == 'MultiPolygon':
+            clipped = max(clipped.geoms, key=lambda g: g.area)
+        return clipped if isinstance(clipped, Polygon) else zone_poly
+    except Exception:
+        return zone_poly
+
+
 def _label_zones(plan: ParsedPlan) -> list:
     zones = []; idx = 0
     annotations = getattr(plan, 'annotations', [])
@@ -91,35 +135,48 @@ def _label_zones(plan: ParsedPlan) -> list:
     if sf_area < 1.0:
         sf_area = 643.60  # fallback: Hamburg EG reference
 
-    # Prefer actual room polygon from DXF over convex hull of shelf positions.
-    # Closed LWPOLYLINEs in the DWG trace the real wall boundaries, which prevents
-    # lights being placed outside the store.
+    # Use building_envelope (pre-computed in parser) if available — it is the most
+    # reliable boundary.  Fall back to the best-coverage room polygon, then convex hull.
+    room_polys = getattr(plan, 'room_polygons', None) or []
+    envelope   = getattr(plan, 'building_envelope', None)
+
+    # building_envelope = WHOLE BUILDING (sales + storage + WC + offices).
+    # It is used only as a clip constraint — never as the sales floor polygon itself.
+    # Sales floor polygon is derived from shelf positions or DXF room polygons.
     sf_poly = None
-    room_polys = getattr(plan, 'room_polygons', None)
+
+    # 1. Find the DXF room polygon with the highest shelf DENSITY (shelves per m²).
+    #    Density beats pure coverage so the actual sales-floor polygon wins over
+    #    the larger building envelope which trivially contains all shelves too.
     if room_polys and shelf_pts:
-        # Pick the SMALLEST polygon that still covers ≥50 % of all shelf positions.
-        # Smallest = tightest fit = actual building footprint.
-        # Upper bound 1200 m² excludes the drawing-sheet boundary polygon that some
-        # DXF exporters emit as an LWPOLYLINE around the entire A0 sheet (≈ 1700 m²+).
-        best_area_m2 = float('inf')
+        best_density = 0.0
         for rp in room_polys:
             area_m2 = rp.area / 1e6
-            if not (200 <= area_m2 <= 1200):
+            if not (80 <= area_m2 <= 1500):
                 continue
             n_covered = sum(1 for pt in shelf_pts if rp.covers(Point(*pt)))
-            coverage_frac = n_covered / max(len(shelf_pts), 1)
-            if coverage_frac >= 0.5 and area_m2 < best_area_m2:
-                best_area_m2 = area_m2
+            coverage  = n_covered / max(len(shelf_pts), 1)
+            if coverage < 0.40:
+                continue
+            density = n_covered / area_m2   # shelves per m²
+            if density > best_density:
+                best_density = density
                 sf_poly = rp
+        if best_density < 0.05:             # fewer than 0.05 shelves/m² → not reliable
+            sf_poly = None
 
+    # 2. Convex hull of shelf positions — clip to envelope to prevent wall bleed
     if sf_poly is None:
         if len(shelf_pts) >= 3:
-            # Fallback: convex hull of shelf positions when no DXF polygon found.
             sf_poly = MultiPoint(shelf_pts).convex_hull
         elif plan.bounds:
             sf_poly = shapely_box(*plan.bounds)
         else:
             sf_poly = shapely_box(0, 0, 67500, 42000)
+        sf_poly = _clip_zone_to_envelope(sf_poly, envelope)
+    else:
+        # DXF polygon found — still clip to envelope as a safety guard
+        sf_poly = _clip_zone_to_envelope(sf_poly, envelope)
 
     n_shelf = sum(1 for f in plan.furniture if f.inferred_type == 'shelving'
                   and sf_poly.contains(Point(f.position)))
@@ -134,11 +191,16 @@ def _label_zones(plan: ParsedPlan) -> list:
         label_text=f"Verkaufsraum {sf_area:.2f}m²"))
     idx += 1
 
+    # Collect checkout zone labels separately so they don't borrow area from
+    # adjacent non-checkout rooms via _spatial_area (e.g. "HK" near "Personal 12.8m²")
+    checkout_lbl_pts = [(l['x_mm'], l['y_mm'])
+                        for l in plan.zone_labels if l['zone_type'] == 'checkout_zone']
+
     # ── Secondary zones (storage, WC, checkout, etc.) ────────────────────────
     for lbl in plan.zone_labels:
         zt = lbl['zone_type']
-        if zt in ('unknown', 'sales_floor'):
-            continue
+        if zt in ('unknown', 'sales_floor', 'checkout_zone'):
+            continue   # checkout handled below
         a = (lbl.get('area_m2') or 0)
         cx, cy = lbl['x_mm'], lbl['y_mm']
 
@@ -158,8 +220,15 @@ def _label_zones(plan: ParsedPlan) -> list:
         if dup:
             continue
 
-        half = math.sqrt(a * 1e6) / 2
-        poly = shapely_box(cx - half, cy - half, cx + half, cy + half)
+        # Prefer the actual DXF room polygon containing this label over a square approximation
+        rp = _find_room_poly_for_label(cx, cy, room_polys)
+        if rp is not None and 10 <= rp.area / 1e6 <= 2000:
+            poly = rp
+        else:
+            half = math.sqrt(a * 1e6) / 2
+            poly = shapely_box(cx - half, cy - half, cx + half, cy + half)
+        # Always clip to building envelope — prevents zones from bleeding through walls
+        poly = _clip_zone_to_envelope(poly, envelope)
         n_s = sum(1 for f in plan.furniture if f.inferred_type == 'shelving'
                   and poly.contains(Point(f.position)))
         n_c = sum(1 for f in plan.furniture if f.inferred_type == 'checkout'
@@ -172,24 +241,40 @@ def _label_zones(plan: ParsedPlan) -> list:
             label_text=lbl.get('text', '')[:60]))
         idx += 1
 
-    # ── Checkout zone from furniture (DWG fallback) ────────────────────────────
-    # DWG anonymous block definitions are lost on conversion, so checkout labels
-    # arrive without area.  Build a zone from the convex hull of detected checkout
-    # furniture inserts when no area-labelled checkout zone was created above.
+    # ── Checkout zone from furniture + labels (DWG fallback) ──────────────────
+    # Build checkout zone from any combination of:
+    #   • detected checkout furniture INSERT positions (kasse, kassentisch, etc.)
+    #   • checkout zone label positions (HK, Hauptkasse, Kasse annotations)
+    # Do NOT clip to building_envelope — checkout is often OUTSIDE the main room
+    # polygon (entrance vestibule), and clipping would erase the zone entirely.
     if not any(z.zone_type == 'checkout_zone' for z in zones):
-        co_labels = [l for l in plan.zone_labels if l['zone_type'] == 'checkout_zone']
-        co_furn   = [f.position for f in plan.furniture if f.inferred_type == 'checkout']
-        if co_labels and len(co_furn) >= 2:
-            # 2500 mm buffer gives ~35-45 m² zone for a compact checkout cluster,
-            # which yields ~25-30 Type D at 1250 mm pitch — matching professional plans.
-            co_hull = MultiPoint(co_furn).convex_hull.buffer(2500)
-            co_area = max(co_hull.area / 1e6, len(co_furn) * 8.0)
+        co_furn = [f.position for f in plan.furniture if f.inferred_type == 'checkout']
+        # Outlier rejection for furniture positions
+        if len(co_furn) >= 3:
+            xs = sorted(p[0] for p in co_furn)
+            ys = sorted(p[1] for p in co_furn)
+            med_x = xs[len(xs) // 2]; med_y = ys[len(ys) // 2]
+            dists = [math.sqrt((p[0]-med_x)**2 + (p[1]-med_y)**2) for p in co_furn]
+            threshold = max(sorted(dists)[len(dists)//2] * 5, 5000)
+            co_furn = [p for p, d in zip(co_furn, dists) if d <= threshold]
+        # Merge with label-position anchors
+        co_pts = list(co_furn) + checkout_lbl_pts
+        if len(co_pts) >= 1:
+            # Buffer is smaller when actual furniture positions constrain the zone
+            # (furniture already spans the counter extent), larger when only text
+            # label anchors are available (need a wider catch-all radius).
+            buf_mm = 2500 if co_furn else 3000
+            hull = MultiPoint(co_pts).convex_hull if len(co_pts) >= 3 else \
+                   Point(co_pts[0]).buffer(buf_mm)
+            co_hull = hull.buffer(buf_mm)
+            co_area = max(co_hull.area / 1e6, len(co_pts) * 8.0)
             zones.append(ZoneResult(
                 polygon_index=idx, polygon=co_hull, zone_type='checkout_zone',
-                confidence=0.75, method='furniture', area_m2=co_area,
+                confidence=0.75, method='furniture',
+                area_m2=co_area,
                 ceiling_height_mm=plan.ceiling_height_mm,
                 furniture_counts={'shelving': 0, 'checkout': len(co_furn)},
-                label_text=f"Checkout ({len(co_furn)} units from furniture)"))
+                label_text=f"Checkout ({len(co_furn)} furn + {len(checkout_lbl_pts)} labels)"))
             idx += 1
 
     return zones
