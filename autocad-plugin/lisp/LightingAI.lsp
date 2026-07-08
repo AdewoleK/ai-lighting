@@ -164,7 +164,7 @@
     old-layer old-osmode old-cmdecho old-pmode
     xmin xmax ymin ymax
     ox oy draw-ox draw-oy pitch START-X START-Y
-    gx gy x-count y-count
+    gx gy x-count y-count sub-lw
     first-gx first-gy anno-x anno-y
     offset-x offset-y area-m2 ok
     ss cnt i ent ed pair
@@ -318,6 +318,37 @@
                 (cons 11 (list xmax gy 0.0))))
         (setq gy      (+ gy pitch))
         (setq y-count (1+ y-count)))
+
+      ;; ── Subdivision lines — bisect each tile into 4 quadrants ───────────
+      ;; Each 1250 mm ceiling tile gets a cross through its centre (at pitch/2
+      ;; offset from the tile-boundary lines), matching the professional
+      ;; Rasterdecke plans.  Lineweight is half the main grid weight so the
+      ;; hierarchy reads clearly: tile edge → subdivision → light symbol.
+      (setq sub-lw (max 9 (fix (/ lai:grid-lw 2))))
+
+      ;; Vertical subdivision lines — midway between each pair of main verticals
+      (setq gx (+ first-gx (* pitch 0.5)))
+      (while (<= gx xmax)
+        (entmake
+          (list (cons 0 "LINE")
+                (cons 8 "AI-DECKENRASTER")
+                (cons 62 lai:grid-color)
+                (cons 370 sub-lw)
+                (cons 10 (list gx ymin 0.0))
+                (cons 11 (list gx ymax 0.0))))
+        (setq gx (+ gx pitch)))
+
+      ;; Horizontal subdivision lines — midway between each pair of main horizontals
+      (setq gy (+ first-gy (* pitch 0.5)))
+      (while (<= gy ymax)
+        (entmake
+          (list (cons 0 "LINE")
+                (cons 8 "AI-DECKENRASTER")
+                (cons 62 lai:grid-color)
+                (cons 370 sub-lw)
+                (cons 10 (list xmin gy 0.0))
+                (cons 11 (list xmax gy 0.0))))
+        (setq gy (+ gy pitch)))
 
       ;; ── Annotation text (Startmaß label) ─────────────────────────────────
       ;; Show the light-position offset (1.00m / 2.00m), not the tile-edge offset.

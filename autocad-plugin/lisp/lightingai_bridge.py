@@ -345,8 +345,11 @@ def generate_inserts(placed: list[dict], cfg_map: dict = None,
     """
     if cfg_map is None:
         cfg_map = {}
-    # Scale block (defined at CUTOUT_R*2 diameter) to fill the pitch-sized grid cell
-    scale = pitch / (CUTOUT_R * 2)
+    # Scale block so symbol is ~40% of the grid pitch in diameter.
+    # This places it cleanly inside one cell with visible margin on all sides,
+    # matching professional Rossmann ceiling plans where each light occupies
+    # exactly one tile (e.g. 500 mm symbol in a 1250 mm cell).
+    scale = pitch * 0.40 / (CUTOUT_R * 2)
     lines = []
     lines.append(";; ── Luminaire inserts ────────────────────────────────────────")
     lines.append("(defun lai:place-luminaires ()")
