@@ -40,35 +40,59 @@ ORIGIN_FILE   = _AI_DIR / "lightingai_origin.json"
 COMMANDS_FILE = _AI_DIR / "lightingai_commands.lsp"
 
 TYPE_ACI = {          # AutoCAD Color Index per luminaire type (defaults)
-    "A": 6,           # magenta
-    "B": 1,           # red
-    "C": 4,           # cyan
-    "D": 2,           # yellow
-    "E": 5,           # blue
+    "A":  6,          # magenta     — K1 interior shelf standard
+    "AW": 22,         # orange-gold — K1 exterior-wall shelf (high-beam driver)
+    "B":  1,          # red         — K4 wide-beam supplement
+    "C":  4,          # cyan        — K3 shelf-domain corner
+    "D":  2,          # yellow      — K2 checkout task lighting
+    "E":  5,          # blue        — K6 Schaufenster track spotlight
+    "W":  3,          # green       — anti-glare honeycomb cosmetics
+    "P":  30,         # orange      — 24° poster accent
 }
 CUTOUT_R  = 64.0      # half of 128 mm cutout diameter
 OUTER_R   = 70.0      # outer circle for legend symbols
 
+# Subposition of each type within the 625mm ceiling tile (from bottom-left corner).
+# Mirrors TILE_SUBPOSITIONS in ceiling_grid.py and real_placer.py usage:
+#   A  → A_center  (312.5, 312.5)  tile centre
+#   AW → B_corner  (150.0, 150.0)  wall-gondola corner
+#   C  → A_center  (312.5, 312.5)  corner-relabeled A
+#   D  → D_special (312.5, 150.0)  checkout downlight
+#   E  → E_special (475.0, 475.0)  column-adjacent track
+SUBPOS_MM: dict[str, tuple[float, float]] = {
+    "A":  (312.5, 312.5),
+    "AW": (150.0, 150.0),
+    "B":  (312.5, 312.5),
+    "C":  (312.5, 312.5),
+    "D":  (312.5, 150.0),
+    "E":  (475.0, 475.0),
+    "W":  (312.5, 312.5),
+    "P":  (312.5, 312.5),
+}
+
 TYPE_CONFIG_FILE = _AI_DIR / "lightingai_typeconfig.json"
 
-DEFAULT_SHAPES = {    # default symbol shape per type letter
-    "A": "Circle",
-    "B": "Square",
-    "C": "Diamond",
-    "D": "Triangle",
-    "E": "Cross",
-    "F": "Hexagon",
+DEFAULT_SHAPES = {    # default symbol shape per type letter (used in legend only)
+    "A":  "Circle",
+    "AW": "Circle",
+    "B":  "Square",
+    "C":  "Diamond",
+    "D":  "Triangle",
+    "E":  "Cross",
+    "W":  "Hexagon",
+    "P":  "Hexagon",
 }
 
 COLOR_NAME_ACI = {    # human-readable color name → ACI value
-    "Red":     1,
-    "Yellow":  2,
-    "Green":   3,
-    "Cyan":    4,
-    "Blue":    5,
-    "Magenta": 6,
-    "White":   7,
-    "Orange":  30,
+    "Red":        1,
+    "Yellow":     2,
+    "Green":      3,
+    "Cyan":       4,
+    "Blue":       5,
+    "Magenta":    6,
+    "White":      7,
+    "Orange":     30,
+    "OrangeGold": 22,   # ACI 22 — used for AW (exterior-wall shelf)
 }
 
 
@@ -219,9 +243,18 @@ def load_type_config() -> dict:
         cfg: dict = {}
         for e in entries:
             t = e.get("type", "")
-            cfg[t] = {
+            raw_color      = e.get("color", "")
+        config_aci     = COLOR_NAME_ACI.get(raw_color, None)
+        type_def_aci   = TYPE_ACI.get(t, 6)
+        # If config has Magenta (stale LIGHTINGAI_CONFIG default) but
+        # this type's TYPE_ACI is not Magenta, trust TYPE_ACI.
+        if config_aci == 6 and type_def_aci != 6:
+            resolved_aci = type_def_aci
+        else:
+            resolved_aci = config_aci if config_aci is not None else type_def_aci
+        cfg[t] = {
                 "shape":       e.get("shape", DEFAULT_SHAPES.get(t, "Circle")),
-                "aci":         COLOR_NAME_ACI.get(e.get("color", "Magenta"), 6),
+                "aci":         resolved_aci,
                 "description": e.get("description", ""),
             }
         return cfg
@@ -231,21 +264,26 @@ def load_type_config() -> dict:
 
 
 def _block_name(t: str, shape: str, aci: int) -> str:
-    """
-    Build a block name that encodes the configured shape and colour.
-    Changing the config → different name → fresh block is always created.
-    e.g. MIKA80E-A-CIR-6, MIKA80E-B-SQR-1
-    """
+    """Block name for legacy symbol-only blocks (used by legend preview)."""
     return f"MIKA80E-{t}-{shape[:3].upper()}-{aci}"
+
+
+def _block_name_tile(t: str, aci: int) -> str:
+    """Block name for the tile-visualisation block placed on the floor plan."""
+    return f"MIKA80E-{t}-TILE-{aci}"
 
 
 def generate_block_defs(types_seen: list[dict], cfg_map: dict = None) -> list[str]:
     """
-    Return LISP code that creates the MIKA80E-* block definitions using ENTMAKE.
-    One block per unique luminaire type (A–E). Shapes and colors come from
-    cfg_map (populated by LIGHTINGAI_CONFIG) or fall back to defaults.
+    Return LISP code that creates the MIKA80E-*-TILE-* block definitions.
 
-    Block name encodes shape+color so config changes always create fresh blocks.
+    Each block represents one 625 mm × 625 mm Rossmann ceiling tile:
+      • Thick coloured outer border  (the type's ACI colour)
+      • Thin grey internal quadrant cross  (divides tile into 4 equal cells)
+      • Light-fixture symbol: circle + crosshair at the type's sub-position
+
+    Block origin = tile bottom-left corner so that inserting at
+      (light_x - subpos_x, light_y - subpos_y) places the tile correctly.
     """
     if cfg_map is None:
         cfg_map = {}
@@ -253,80 +291,61 @@ def generate_block_defs(types_seen: list[dict], cfg_map: dict = None) -> list[st
     lines.append(";; ── Block definitions ───────────────────────────────────────")
     lines.append("(defun lai:make-blocks ()")
 
-    for lp in types_seen:
-        t     = lp["lumi_type"]
-        cfg   = cfg_map.get(t, {})
-        aci   = cfg.get("aci",   TYPE_ACI.get(t, 6))
-        shape = cfg.get("shape", DEFAULT_SHAPES.get(t, "Circle"))
-        r     = CUTOUT_R
-        bn    = _block_name(t, shape, aci)
+    import math as _m
 
-        lines.append(f'  ;; Type {t}: {lp["description"]}  [{shape} / ACI {aci}]')
+    pitch  = 625.0   # tile size in mm
+    qc     = pitch / 2.0  # 312.5 — quadrant midline
+    sym_r  = 60.0    # radius of the fixture circle inside the tile
+    BORDER_LW  = 70  # lineweight for coloured outer border (0.70 mm)
+    QUAD_LW    = 18  # lineweight for grey quadrant lines  (0.18 mm)
+    SYM_LW     = 50  # lineweight for the fixture circle   (0.50 mm)
+    CROSS_LW   = 25  # lineweight for crosshair inside circle
+
+    for lp in types_seen:
+        t   = lp["lumi_type"]
+        cfg = cfg_map.get(t, {})
+        aci = cfg.get("aci", TYPE_ACI.get(t, 6))
+        sx, sy = SUBPOS_MM.get(t, (312.5, 312.5))
+        bn  = _block_name_tile(t, aci)
+
+        lines.append(f'  ;; Type {t}  sub-pos=({sx},{sy})  ACI={aci}')
         lines.append(f'  (if (not (tblsearch "BLOCK" "{bn}"))')
         lines.append(f'    (progn')
-        # Begin block definition
-        lines.append(f'      (entmake (list (cons 0 "BLOCK") (cons 2 "{bn}") (cons 10 (list 0 0 0)) (cons 70 0)))')
-        import math as _m
+        lines.append(f'      (entmake (list (cons 0 "BLOCK") (cons 2 "{bn}") '
+                     f'(cons 10 (list 0 0 0)) (cons 70 0)))')
 
-        def _blk_line(x1, y1, x2, y2):
-            return (f'      (entmake (list (cons 0 "LINE") (cons 8 "0") (cons 62 {aci}) '
-                    f'(cons 10 (list {x1:.4f} {y1:.4f} 0)) (cons 11 (list {x2:.4f} {y2:.4f} 0))))')
+        def _L(x1, y1, x2, y2, col, lw):
+            return (f'      (entmake (list (cons 0 "LINE") (cons 8 "0") (cons 62 {col}) '
+                    f'(cons 370 {lw}) '
+                    f'(cons 10 (list {x1:.4f} {y1:.4f} 0)) '
+                    f'(cons 11 (list {x2:.4f} {y2:.4f} 0))))')
 
-        def _blk_circle(radius):
-            return (f'      (entmake (list (cons 0 "CIRCLE") (cons 8 "0") (cons 62 {aci}) '
-                    f'(cons 10 (list 0 0 0)) (cons 40 {radius:.4f})))')
+        def _C(cx, cy, r, col, lw):
+            return (f'      (entmake (list (cons 0 "CIRCLE") (cons 8 "0") (cons 62 {col}) '
+                    f'(cons 370 {lw}) '
+                    f'(cons 10 (list {cx:.4f} {cy:.4f} 0)) (cons 40 {r:.4f})))')
 
-        def _poly_lines(n, radius, start_deg=90):
-            pts = [(_m.cos(_m.radians(start_deg + 360/n*i)) * radius,
-                    _m.sin(_m.radians(start_deg + 360/n*i)) * radius) for i in range(n)]
-            return [_blk_line(pts[i][0], pts[i][1], pts[(i+1)%n][0], pts[(i+1)%n][1])
-                    for i in range(n)]
+        # 1. Outer coloured border — four thick lines
+        lines += [
+            _L(0,     0,     pitch, 0,     aci, BORDER_LW),
+            _L(pitch, 0,     pitch, pitch, aci, BORDER_LW),
+            _L(pitch, pitch, 0,     pitch, aci, BORDER_LW),
+            _L(0,     pitch, 0,     0,     aci, BORDER_LW),
+        ]
 
-        # Shape-specific geometry (driven by user config or defaults)
-        if shape == "Circle":
-            lines += [_blk_circle(r), _blk_circle(r*0.30),
-                      _blk_line(-r*0.6, 0, r*0.6, 0), _blk_line(0, -r*0.6, 0, r*0.6)]
-        elif shape == "Square":
-            lines += [_blk_line(-r,-r, r,-r), _blk_line(r,-r, r,r),
-                      _blk_line(r,r, -r,r),   _blk_line(-r,r, -r,-r),
-                      _blk_circle(r*0.20)]
-        elif shape == "Diamond":
-            lines += [_blk_line(0,-r, r,0), _blk_line(r,0, 0,r),
-                      _blk_line(0,r, -r,0),  _blk_line(-r,0, 0,-r),
-                      _blk_circle(r*0.20)]
-        elif shape == "Triangle":
-            tx1,ty1 = -r*0.866025, r*0.5
-            tx2,ty2 =  r*0.866025, r*0.5
-            tx3,ty3 =  0.0,       -r
-            lines += [_blk_line(tx1,ty1,tx2,ty2), _blk_line(tx2,ty2,tx3,ty3),
-                      _blk_line(tx3,ty3,tx1,ty1), _blk_circle(r*0.20)]
-        elif shape == "Cross":
-            lines += [_blk_circle(r),
-                      _blk_line(-r*0.6,-r*0.6, r*0.6,r*0.6),
-                      _blk_line(-r*0.6, r*0.6, r*0.6,-r*0.6)]
-        elif shape == "Hexagon":
-            lines += _poly_lines(6, r, start_deg=90)
-        elif shape == "Pentagon":
-            lines += _poly_lines(5, r, start_deg=90)
-        elif shape == "Octagon":
-            lines += _poly_lines(8, r, start_deg=22.5)
-        elif shape == "Star":
-            star = []
-            for i in range(10):
-                ang = _m.radians(i * 36 - 90)
-                rad = r if i % 2 == 0 else r * 0.42
-                star.append((_m.cos(ang)*rad, _m.sin(ang)*rad))
-            lines += [_blk_line(star[i][0],star[i][1],
-                                star[(i+1)%10][0],star[(i+1)%10][1]) for i in range(10)]
-        elif shape == "Plus":
-            t = r * 0.28
-            plus = [(-t,-r),(t,-r),(t,-t),(r,-t),(r,t),(t,t),
-                    (t,r),(-t,r),(-t,t),(-r,t),(-r,-t),(-t,-t)]
-            lines += [_blk_line(plus[i][0],plus[i][1],
-                                plus[(i+1)%12][0],plus[(i+1)%12][1]) for i in range(12)]
-        else:
-            lines += [_blk_circle(r), _blk_circle(r*0.35)]
-        # End block definition
+        # 2. Internal quadrant dividers — thin grey cross
+        lines += [
+            _L(0,  qc, pitch, qc, 8, QUAD_LW),   # horizontal midline
+            _L(qc, 0,  qc, pitch, 8, QUAD_LW),   # vertical midline
+        ]
+
+        # 3. Fixture symbol at sub-position: outer circle + crosshair
+        lines += [
+            _C(sx, sy, sym_r, aci, SYM_LW),
+            _L(sx - sym_r*0.65, sy, sx + sym_r*0.65, sy, aci, CROSS_LW),
+            _L(sx, sy - sym_r*0.65, sx, sy + sym_r*0.65, aci, CROSS_LW),
+        ]
+
         lines.append(f'      (entmake (list (cons 0 "ENDBLK") (cons 8 "0")))')
         lines.append(f'    ) ;; end progn')
         lines.append(f'  ) ;; end if')
@@ -338,36 +357,37 @@ def generate_block_defs(types_seen: list[dict], cfg_map: dict = None) -> list[st
 
 
 def generate_inserts(placed: list[dict], cfg_map: dict = None,
-                     pitch: float = 1250.0) -> list[str]:
+                     pitch: float = 625.0) -> list[str]:
     """
-    Return LISP code that INSERTs every luminaire block.
-    Scale is derived from grid pitch so each symbol fills its full grid cell.
+    Return LISP code that INSERTs every luminaire tile block.
+
+    Each block is a full 625 mm × 625 mm tile (see generate_block_defs).
+    It is inserted at the tile bottom-left corner:
+        tile_origin = light_position - subposition_offset
+    Scale = 1.0 (block is already defined at real mm size).
     """
     if cfg_map is None:
         cfg_map = {}
-    # Scale block so symbol is ~40% of the grid pitch in diameter.
-    # This places it cleanly inside one cell with visible margin on all sides,
-    # matching professional Rossmann ceiling plans where each light occupies
-    # exactly one tile (e.g. 500 mm symbol in a 1250 mm cell).
-    scale = pitch * 0.40 / (CUTOUT_R * 2)
     lines = []
     lines.append(";; ── Luminaire inserts ────────────────────────────────────────")
     lines.append("(defun lai:place-luminaires ()")
     lines.append('  (setvar "CLAYER" "AI-LUMINAIRES")')
 
     for lp in placed:
-        t     = lp["lumi_type"]
-        cfg   = cfg_map.get(t, {})
-        aci   = cfg.get("aci",   TYPE_ACI.get(t, 6))
-        shape = cfg.get("shape", DEFAULT_SHAPES.get(t, "Circle"))
-        bn    = _block_name(t, shape, aci)   # must match generate_block_defs
-        rot   = lp.get("rotation", 0.0)
-        rot_rad = rot * 3.14159265 / 180.0
+        t   = lp["lumi_type"]
+        cfg = cfg_map.get(t, {})
+        aci = cfg.get("aci", TYPE_ACI.get(t, 6))
+        bn  = _block_name_tile(t, aci)
+
+        # Tile bottom-left = light position minus subposition offset
+        sx, sy = SUBPOS_MM.get(t, (312.5, 312.5))
+        tile_x = lp["x"] - sx
+        tile_y = lp["y"] - sy
 
         lines.append(
             f'  (entmake (list (cons 0 "INSERT") (cons 2 "{bn}") '
-            f'(cons 10 (list {lp["x"]:.4f} {lp["y"]:.4f} 0)) '
-            f'(cons 41 {scale:.6f}) (cons 42 {scale:.6f}) (cons 50 {rot_rad:.6f}) '
+            f'(cons 10 (list {tile_x:.4f} {tile_y:.4f} 0)) '
+            f'(cons 41 1.0) (cons 42 1.0) (cons 50 0.0) '
             f'(cons 8 "AI-LUMINAIRES") (cons 62 {aci})))'
         )
 
@@ -380,6 +400,7 @@ def generate_inserts(placed: list[dict], cfg_map: dict = None,
 def generate_legend(placed: list[dict], cfg_map: dict = None,
                     fp_right_x: float = None,
                     fp_top_y: float = None,
+                    fp_bot_y: float = None,
                     floor_area_m2: float = None) -> list[str]:
     """Draw the Leuchtenlegende panel to the right of the drawing.
 
@@ -409,44 +430,57 @@ def generate_legend(placed: list[dict], cfg_map: dict = None,
     watt_per_m2 = (total_watt / floor_area_m2) if floor_area_m2 else None
 
     _DEFAULT_DESCS = {
-        'A': "MIKA80-E K1 Regalbeleuchtung 15W 40° 2400lm 3000K",
-        'B': "MIKA80-E K4 Ergänzungsbeleuchtung 20W 60° 3200lm 3000K",
-        'C': "MIKA80-E K3 Regalbeleuchtung Rand 15W 40° 2400lm 3000K",
-        'D': "MIKA80-E K2 Checkout/Service 20W 40° 3200lm 3000K",
-        'E': "NEO85-SX K6 Schaufenster-Strahler 20W 60° 3200lm Track",
+        'A':  "MIKA80-E K1 Regalbeleuchtung 15W 40° 2400lm 3000K",
+        'AW': "MIKA80-E K1 Außenwand Beam-M-high 20W 40° 3200lm 3000K",
+        'B':  "MIKA80-E K4 Ergänzungsbeleuchtung 20W 60° 3200lm 3000K",
+        'C':  "MIKA80-E K3 Regalbeleuchtung Rand 15W 40° 2400lm 3000K",
+        'D':  "MIKA80-E K2 Checkout/Service 20W 40° 3200lm 3000K",
+        'E':  "NEO85-SX K6 Schaufenster-Strahler 20W 60° 3200lm Track",
+        'W':  "MIKA80-E Wabeneinsatz 20W 36° 1700lm Anti-Glare 3000K",
+        'P':  "MIKA80-E K5 Plakate 16W 24° 2100lm Power-Linse 3000K",
     }
     configured   = sorted(cfg_map.keys()) if cfg_map else []
     extra        = [t for t in sorted(seen.keys()) if t not in cfg_map]
     type_letters = configured + extra if configured else sorted(seen.keys())
     types = []
     for t in type_letters:
+        if type_count.get(t, 0) == 0:
+            continue  # omit types with no placed lights from the legend
         if t in seen:
             types.append(seen[t])
         else:
             types.append({"lumi_type": t, "description": _DEFAULT_DESCS.get(t, f"Type {t}")})
 
     ref_x = fp_right_x if fp_right_x is not None else max_x
-    lx    = ref_x + 30_000
     ly    = fp_top_y if fp_top_y is not None else max_y
-    rowH  = 16_000
-    cr    = 7_000
-    th    = 2_500
 
     # Footer rows: totals + (optionally) floor-area/W-per-m²
     FOOTER_ROWS = 2 if (floor_area_m2 and watt_per_m2 is not None) else 1
     n_data = len(types)
-    # Total height covers data rows + footer rows
-    W     = 220_000   # widened: description + count + wattage columns all fit
-    totH  = rowH * (n_data + FOOTER_ROWS)
+
+    # ── Dynamic sizing: scale legend to match floor-plan height ──────────────
+    # Derive floor height from fp bounds; fall back to placed-light extent.
+    if fp_top_y is not None and fp_bot_y is not None:
+        fp_height = max(abs(fp_top_y - fp_bot_y), 1.0)
+    else:
+        ys = [p["y"] for p in placed]
+        fp_height = max(max(ys) - min(ys), 10_000)
+    rowH  = fp_height / max(n_data + FOOTER_ROWS, 1)
+    cr    = rowH * 0.44    # symbol circle radius
+    th    = rowH * 0.15    # text height
+    W     = rowH * 13.75   # total legend width (same aspect ratio as before)
+
+    lx    = ref_x + max(rowH * 1.875, 10_000)   # gap between drawing and legend
+    totH  = fp_height   # legend same height as floor plan
     bot_y = ly - totH
 
-    # Column X positions
-    c1x    = lx + 13_000   # end of type-letter col
-    c2x    = lx + 31_000   # end of symbol col
-    c3x    = lx + 170_000  # end of description col
-    c4x    = lx + 195_000  # end of count col  → wattage fills c4x→lx+W
+    # Column X positions (all proportional to rowH)
+    c1x    = lx + rowH * 0.8125    # end of type-letter col
+    c2x    = lx + rowH * 1.9375    # end of symbol col
+    c3x    = lx + rowH * 10.625    # end of description col
+    c4x    = lx + rowH * 12.1875   # end of count col → wattage fills to lx+W
     sym_cx = (c1x + c2x) / 2
-    desc_x = c2x + 2_000
+    desc_x = c2x + rowH * 0.125
 
     lines = []
     lines.append(";; ── Legend ───────────────────────────────────────────────────")
@@ -520,7 +554,7 @@ def generate_legend(placed: list[dict], cfg_map: dict = None,
             lines.append(hline(lx, row_top, lx + W))
 
         # Col 1: type letter
-        lines.append(txt(lx + 3_000, cy - th * 0.4, th, aci, t))
+        lines.append(txt(lx + rowH * 0.19, cy - th * 0.4, th, aci, t))
 
         # Col 2: symbol
         cx = sym_cx
@@ -578,18 +612,18 @@ def generate_legend(placed: list[dict], cfg_map: dict = None,
         lines.append(txt(desc_x, cy - th * 0.4, th * 0.85, 7, _esc(desc)))
 
         # Col 4: count (right-aligned)
-        lines.append(txt(c4x - 2_000, cy - th * 0.4, th, aci, str(qty), align='R'))
+        lines.append(txt(c4x - rowH * 0.125, cy - th * 0.4, th, aci, str(qty), align='R'))
 
         # Col 5: total wattage (right-aligned)
-        lines.append(txt(lx + W - 2_000, cy - th * 0.4, th, 7,
+        lines.append(txt(lx + W - rowH * 0.125, cy - th * 0.4, th, 7,
                          f"{watt_tot:.0f} W", align='R'))
 
     # ── Footer: totals row ────────────────────────────────────────────────────
     lines.append(hline(lx, footer_top, lx + W))
     f1_cy = footer_top - rowH * 0.5 - th * 0.4
-    lines.append(txt(lx + 3_000, f1_cy, th, 7,
+    lines.append(txt(lx + rowH * 0.19, f1_cy, th, 7,
                      f"Gesamt / Total:  {total_count} Leuchten"))
-    lines.append(txt(lx + W - 2_000, f1_cy, th, 7,
+    lines.append(txt(lx + W - rowH * 0.125, f1_cy, th, 7,
                      f"{total_watt:.0f} W", align='R'))
 
     # ── Footer: floor area / W per m² ────────────────────────────────────────
@@ -597,7 +631,7 @@ def generate_legend(placed: list[dict], cfg_map: dict = None,
         f2_top = footer_top - rowH
         lines.append(hline(lx, f2_top, lx + W))
         f2_cy  = f2_top - rowH * 0.5 - th * 0.4
-        lines.append(txt(lx + 3_000, f2_cy, th * 0.82, 8,
+        lines.append(txt(lx + rowH * 0.19, f2_cy, th * 0.82, 8,
                          f"Fläche / Floor area: {floor_area_m2:.0f} m²"
                          f"     Leistungsdichte / Lighting load: {watt_per_m2:.2f} W/m²"))
 
@@ -858,7 +892,7 @@ def write_commands_lsp(out_path: Path, result: dict,
 
     # Read grid pitch and floor-plan bounds from origin file.
     # fp_xmax/ymax are the bounding box of the store LWPOLYLINE (from LIGHTINGAI_GRID).
-    pitch = 1250.0
+    pitch = 625.0   # 625mm — Rossmann Referenzmaß Rasterdecke
     grid_fp_xmin: float | None = None
     grid_fp_ymin: float | None = None
     grid_fp_xmax: float | None = None
@@ -866,7 +900,7 @@ def write_commands_lsp(out_path: Path, result: dict,
     if ORIGIN_FILE.exists():
         try:
             _orig = json.loads(ORIGIN_FILE.read_text())
-            pitch = float(_orig.get("pitch", 1250))
+            pitch = float(_orig.get("pitch", 625))
             _x1 = _orig.get("fp_xmin", 0); _y1 = _orig.get("fp_ymin", 0)
             _x2 = _orig.get("fp_xmax", 0); _y2 = _orig.get("fp_ymax", 0)
             if _x2: grid_fp_xmax = float(_x2)
@@ -896,11 +930,14 @@ def write_commands_lsp(out_path: Path, result: dict,
     # Write canonical descriptions to suggestions file — one distinct product per slot
     # so the GUI always has 5 non-duplicate options regardless of floor plan.
     _canonical_descs = {
-        'A': "MIKA80-E K1 Regalbeleuchtung 15W 40° 2400lm 3000K",
-        'B': "MIKA80-E K4 Ergänzungsbeleuchtung 20W 60° 3200lm 3000K",
-        'C': "MIKA80-E K3 Regalbeleuchtung Rand 15W 40° 2400lm 3000K",
-        'D': "MIKA80-E K2 Checkout/Service 20W 40° 3200lm 3000K",
-        'E': "NEO85-SX K6 Schaufenster-Strahler 20W 60° 3200lm Track",
+        'A':  "MIKA80-E K1 Regalbeleuchtung 15W 40° 2400lm 3000K",
+        'AW': "MIKA80-E K1 Außenwand Beam-M-high 20W 40° 3200lm 3000K",
+        'B':  "MIKA80-E K4 Ergänzungsbeleuchtung 20W 60° 3200lm 3000K",
+        'C':  "MIKA80-E K3 Regalbeleuchtung Rand 15W 40° 2400lm 3000K",
+        'D':  "MIKA80-E K2 Checkout/Service 20W 40° 3200lm 3000K",
+        'E':  "NEO85-SX K6 Schaufenster-Strahler 20W 60° 3200lm Track",
+        'W':  "MIKA80-E Wabeneinsatz 20W 36° 1700lm Anti-Glare 3000K",
+        'P':  "MIKA80-E K5 Plakate 16W 24° 2100lm Power-Linse 3000K",
     }
     suggestions_file = _AI_DIR / "lightingai_suggestions.json"
     try:
@@ -935,12 +972,15 @@ def write_commands_lsp(out_path: Path, result: dict,
 
     fp_right_x = grid_fp_xmax if grid_fp_xmax is not None else zone_right_x
     fp_top_y   = grid_fp_ymax if grid_fp_ymax is not None else zone_top_y
+    fp_bot_y   = (grid_fp_ymin if grid_fp_ymin is not None
+                  else (min(p["y"] for p in placed) if placed else None))
 
     sections += generate_block_defs(unique_types, cfg_map)
     sections += generate_inserts(placed, cfg_map, pitch=pitch)
     sections += generate_legend(placed, cfg_map,
                                 fp_right_x=fp_right_x,
                                 fp_top_y=fp_top_y,
+                                fp_bot_y=fp_bot_y,
                                 floor_area_m2=floor_area_m2)
 
     content = "\n".join(sections)
@@ -957,11 +997,14 @@ def write_commands_lsp(out_path: Path, result: dict,
             type_watt[t]  = type_watt.get(t, 0.0) + lp.get("wattage", 0.0)
 
         _DEFAULT_DESCS_S = {
-            'A': "MIKA80-E K1 Regalbeleuchtung 15W 40° 2400lm 3000K",
-            'B': "MIKA80-E K4 Ergänzungsbeleuchtung 20W 60° 3200lm 3000K",
-            'C': "MIKA80-E K3 Regalbeleuchtung Rand 15W 40° 2400lm 3000K",
-            'D': "MIKA80-E K2 Checkout/Service 20W 40° 3200lm 3000K",
-            'E': "NEO85-SX K6 Schaufenster-Strahler 20W 60° 3200lm Track",
+            'A':  "MIKA80-E K1 Regalbeleuchtung 15W 40° 2400lm 3000K",
+            'AW': "MIKA80-E K1 Außenwand Beam-M-high 20W 40° 3200lm 3000K",
+            'B':  "MIKA80-E K4 Ergänzungsbeleuchtung 20W 60° 3200lm 3000K",
+            'C':  "MIKA80-E K3 Regalbeleuchtung Rand 15W 40° 2400lm 3000K",
+            'D':  "MIKA80-E K2 Checkout/Service 20W 40° 3200lm 3000K",
+            'E':  "NEO85-SX K6 Schaufenster-Strahler 20W 60° 3200lm Track",
+            'W':  "MIKA80-E Wabeneinsatz 20W 36° 1700lm Anti-Glare 3000K",
+            'P':  "MIKA80-E K5 Plakate 16W 24° 2100lm Power-Linse 3000K",
         }
         total_count = sum(type_count.values())
         total_watt  = sum(type_watt.values())

@@ -386,49 +386,12 @@ def generate_shelf_row_candidates(
                     x=round(cx, 1), y=round(cy, 1),
                     tile_i=i, tile_j=j, subposition=subpos))
 
-    # ── Wall gondola pass — AUSSEN (exterior-wall shelf) candidates ───────────
-    # Gondola rows whose A_center tile sits within EXTERIOR_WALL_THRESHOLD_MM of
-    # the zone polygon boundary are exterior wall shelves.  The aisle loop above
-    # already placed INNEN-style lights at the midpoint between these rows and the
-    # adjacent interior gondola.  This pass additionally places candidates AT the
-    # wall gondola tile position so that classify_wall_relation sees them close
-    # enough to the building envelope to classify as AW (Außenwand).
-    # Using the A_center distance (not the raw gondola Y) ensures we only run this
-    # pass when the generated candidate will actually be classified as AW — avoiding
-    # spurious A-lights on gondola positions that are too far from the wall.
-    # The outermost gondola row in each direction is the wall gondola (Wandfläche),
-    # even if there is a ~1m walking clearance between it and the physical wall.
-    # EXTERIOR_WALL_THRESHOLD_MM catches rows that are genuinely against the wall;
-    # OUTERMOST_WALL_MM is a generous fallback for the first and last rows.
-    _OUTERMOST_WALL_MM = pitch * 3.5   # 2187.5mm — outermost row tolerance
-    _wg_zone_bnd = zone_poly.boundary
-    _gondola_ys_set = set(gondola_ys)
-    _gy_min = gondola_ys[0]  if gondola_ys else None
-    _gy_max = gondola_ys[-1] if gondola_ys else None
-    for _wgy in gondola_ys:
-        _wg_xs = h_rows[_wgy]
-        _wg_mid_x = (min(_wg_xs) + max(_wg_xs)) / 2 if _wg_xs else 0.0
-        # A_center of the tile containing _wgy
-        _wg_j   = math.floor((_wgy - oy) / pitch)
-        _wg_cy  = oy + _wg_j * pitch + 312.5
-        _wg_dist = Point(_wg_mid_x, _wg_cy).distance(_wg_zone_bnd)
-        _is_outermost = (_wgy == _gy_min or _wgy == _gy_max)
-        _threshold = _OUTERMOST_WALL_MM if _is_outermost else EXTERIOR_WALL_THRESHOLD_MM
-        if _wg_dist >= _threshold:
-            continue   # A_center too far from zone boundary → won't be AW; skip
-        for _lx in _run_positions_phased(_wg_xs, ox):
-            _cx, _cy = snap_to_subposition(_lx, _wgy, ox, oy, pitch, subpos)
-            _key = (round(_cx), round(_cy))
-            if _key in seen_keys:
-                continue
-            if zone_buf.contains(Point(_cx, _cy)):
-                _i = round((_lx - ox) / pitch)
-                _j = round((_wgy - oy) / pitch)
-                seen_keys.add(_key)
-                candidates.append(GridCandidate(
-                    x=round(_cx, 1), y=round(_cy, 1),
-                    tile_i=_i, tile_j=_j, subposition=subpos,
-                    wall_relation='exterior_wall'))
+    # Wall gondola pass removed: previously placed candidates AT the gondola Y
+    # (on the shelf body), which caused lights to appear inside gondola furniture.
+    # The aisle loop above already handles wall shelves correctly: the midpoint
+    # between the wall gondola row and the adjacent interior gondola lands in the
+    # aisle and is classified as AW by classify_wall_relation (proximity to the
+    # building envelope) or by the depth/assortment signal in _shelf_wall_signal.
 
     # ── Aisle-based candidate generation (vertical shelf columns / specialty zone)
     # For specialty zones where gondolas run N-S (V-columns), aisles are E-W
@@ -469,40 +432,10 @@ def generate_shelf_row_candidates(
                     x=round(cx, 1), y=round(cy, 1),
                     tile_i=i, tile_j=j, subposition=subpos))
 
-    # ── Wall column pass — AUSSEN (exterior-wall V-column) candidates ──────────
-    # Mirror of the wall gondola pass for horizontal rows.
-    # Vertical gondola columns whose A_center tile sits within
-    # EXTERIOR_WALL_THRESHOLD_MM of the zone boundary are treated as exterior-wall
-    # shelves.  The general V-column pass above already placed candidates within
-    # v_wall_threshold of the boundary; this pass additionally places candidates
-    # AT the gondola column X position when they are truly wall-adjacent, so that
-    # classify_wall_relation sees them as AW regardless of building_envelope
-    # accuracy.  Captures E/W-wall shelving that the H-row aisle loop misses.
-    _gondola_xs_sorted = sorted(v_cols.keys())
-    _gx_min = _gondola_xs_sorted[0]  if _gondola_xs_sorted else None
-    _gx_max = _gondola_xs_sorted[-1] if _gondola_xs_sorted else None
-    for _wcx, _wc_ys in v_cols.items():
-        _wc_mid_y = (min(_wc_ys) + max(_wc_ys)) / 2 if _wc_ys else 0.0
-        _wc_i     = math.floor((_wcx - ox) / pitch)
-        _wc_cx    = ox + _wc_i * pitch + 312.5   # A_center X of tile containing _wcx
-        _wc_dist  = Point(_wc_cx, _wc_mid_y).distance(zone_boundary)
-        _is_outermost_col = (_wcx == _gx_min or _wcx == _gx_max)
-        _wc_threshold = _OUTERMOST_WALL_MM if _is_outermost_col else EXTERIOR_WALL_THRESHOLD_MM
-        if _wc_dist >= _wc_threshold:
-            continue   # A_center too far from zone boundary → won't be AW; skip
-        for _ly in _run_positions_phased(_wc_ys, oy):
-            _cx, _cy = snap_to_subposition(_wcx, _ly, ox, oy, pitch, subpos)
-            _key = (round(_cx), round(_cy))
-            if _key in seen_keys:
-                continue
-            if zone_buf.contains(Point(_cx, _cy)):
-                _i = round((_wcx - ox) / pitch)
-                _j = round((_ly - oy) / pitch)
-                seen_keys.add(_key)
-                candidates.append(GridCandidate(
-                    x=round(_cx, 1), y=round(_cy, 1),
-                    tile_i=_i, tile_j=_j, subposition=subpos,
-                    wall_relation='exterior_wall'))
+    # Wall column pass removed for the same reason as the wall gondola pass:
+    # it placed candidates AT the gondola column X position (on the shelf body).
+    # V-aisle midpoints near the building envelope are classified as AW by
+    # classify_wall_relation, so no separate wall-column pass is needed.
 
     return candidates
 

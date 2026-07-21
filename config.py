@@ -25,7 +25,8 @@ DEFAULT_LAYER_MAP = {
     "walls":      ["WALLS","A-WALL","WAND","0",
                    "01_Grundriss","15_Kontur_drüber","01_Möbel_Nebenräume"],
     "ceiling":    ["CEILING","A-CLNG","DECKE","RASTERDECKE","08_TGA"],
-    "grid":       ["GRID","CEILING-GRID","RASTER","A-CLNG-GRID","DECKENRASTER","01_Höhen"],
+    "grid":       ["GRID","CEILING-GRID","RASTER","A-CLNG-GRID","DECKENRASTER","01_Höhen",
+                   "MF_RASTER"],  # Rossmann output DXF grid layer
     "doors":      ["DOORS","A-DOOR","TUR","TUER"],
     "windows":    ["WINDOWS","A-GLAZ","FENSTER"],
     "furniture":  ["FURNITURE","A-FURN","EINRICHTUNG",
@@ -40,7 +41,7 @@ DEFAULT_LAYER_MAP = {
 ZONE_TYPES = ["sales_floor","checkout_zone","entrance","storage",
               "office","corridor","service_area","unknown"]
 
-GRID_PITCH_MM     = 1250
+GRID_PITCH_MM     = 625   # 625mm tile module — Rossmann Rasterdecke standard
 MIN_WALL_CLEARANCE= 400
 MIN_LUMI_SPACING  = 875
 DEFAULT_CEILING_H = 3000

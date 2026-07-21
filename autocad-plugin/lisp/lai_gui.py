@@ -1109,6 +1109,8 @@ def open_config_dialog():
     def save_config():
         import pathlib, threading
         n = num_types.get()
+        # Types the GUI manages (A through the nth letter, e.g. A-E for n=5)
+        gui_types = {chr(65 + i) for i in range(n)}
         config = [
             {"type":        chr(65 + i),
              "shape":       selections[i]['shape'],
@@ -1116,8 +1118,17 @@ def open_config_dialog():
              "description": selections[i]['description'].strip()}
             for i in range(n)
         ]
-        payload = json.dumps(config)
+        # Preserve entries for types not managed by this GUI (AW, W, P, etc.)
+        # so that the canonical Rossmann type table is never silently truncated.
         dest = pathlib.Path.home() / "ai-lighting" / "lightingai_typeconfig.json"
+        if dest.exists():
+            try:
+                for _e in json.loads(dest.read_text()):
+                    if _e.get("type") not in gui_types:
+                        config.append(_e)
+            except Exception:
+                pass
+        payload = json.dumps(config, ensure_ascii=False)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(payload)
         # Also write to /tmp/ for backward compat with older loaded LISP sessions

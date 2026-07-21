@@ -87,6 +87,13 @@ def _run_pipeline(job_id: str, plan_path: Path,
         db.update_job(job_id, status, message)
 
     try:
+        _set("processing", "Loading ML models…")
+        try:
+            from main import _ensure_models
+            _ensure_models()
+        except Exception:
+            pass   # non-fatal — geometric fallback still works
+
         _set("processing", "Parsing plan…")
 
         from services.parser.pdf_parser import RealPlanParser
@@ -163,10 +170,13 @@ def _run_pipeline(job_id: str, plan_path: Path,
             "total_luminaires": len(result.placed),
             "total_wattage":    round(result.total_wattage()),
             "type_A":           len(result.by_type("A")),
+            "type_AW":          len(result.by_type("AW")),
             "type_B":           len(result.by_type("B")),
             "type_C":           len(result.by_type("C")),
             "type_D":           len(result.by_type("D")),
             "type_E":           len(result.by_type("E")),
+            "type_W":           len(result.by_type("W")),
+            "type_P":           len(result.by_type("P")),
             "zones":            zones_data,
             "zone_reports":     zone_reports_data,
             "placed":           placed_data,

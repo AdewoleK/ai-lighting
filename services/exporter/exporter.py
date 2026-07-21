@@ -34,7 +34,8 @@ TITLE_LAYER = "TITLEBLOCK"
 LEGEND_LAYER= "LEGEND"
 ANNO_LAYER  = "ANNOTATIONS"
 
-COLOR_A    = 6   # magenta    — K1 shelf inner
+COLOR_A    = 6   # magenta    — K1 shelf interior standard
+COLOR_AW   = 6   # magenta    — K1 exterior-wall shelf high-beam (same symbol as A)
 COLOR_B    = 1   # red        — K4 supplement wide-angle
 COLOR_C    = 4   # cyan       — K3 shelf edge / perimeter
 COLOR_D    = 2   # yellow     — K2 checkout / service strong
@@ -45,7 +46,7 @@ COLOR_ZONE = 140 # light blue — zone outlines
 COLOR_GRID = 8   # dark grey  — ceiling grid
 COLOR_DIM  = 7   # white/black — dimensions
 
-LUMI_COLORS = {'A': COLOR_A, 'B': COLOR_B, 'C': COLOR_C,
+LUMI_COLORS = {'A': COLOR_A, 'AW': COLOR_AW, 'B': COLOR_B, 'C': COLOR_C,
                'D': COLOR_D, 'E': COLOR_E, 'W': COLOR_W, 'P': COLOR_P}
 
 CUTOUT_MM   = 128   # DA (visible cutout diameter)
@@ -314,13 +315,14 @@ def _draw_legend(msp, x0: float, y0: float, result: PlacementResult):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _draw_ceiling_grid(msp, classified: "ClassifiedPlan",
-                       pitch_mm: float = 1250.0) -> None:
+                       pitch_mm: float = 625.0) -> None:
     """
     Draw ceiling tile boundary lines on CEILING-GRID layer.
 
-    Grid lines are drawn at light_origin ± pitch/2 so that each luminaire
-    position sits at the CENTER of its 1250×1250 mm ceiling module, matching
-    the MAX FRANKE.led professional Deckenrasterplan layout.
+    Grid lines are drawn at `pitch_mm` intervals starting from the Startmaß
+    origin (1000mm, 2000mm from the zone corner).  pitch_mm = 625mm is the
+    Rossmann Referenzmaß Rasterdecke (tile module).  Luminaires sit at the
+    A_center sub-position (312.5mm from tile corner) inside each tile.
     """
     sf_z = next((z for z in classified.zones if z.zone_type == 'sales_floor'), None)
     if sf_z is None:
@@ -348,10 +350,10 @@ def _draw_ceiling_grid(msp, classified: "ClassifiedPlan",
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dimension chains (showing 1250mm grid pitch)
+# Dimension chains (showing 625mm tile grid and 1250mm inter-luminaire spacing)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _draw_dimensions(msp, result: PlacementResult, pitch_mm: float = 1250.0):
+def _draw_dimensions(msp, result: PlacementResult, pitch_mm: float = 625.0):
     """
     Add a row and column of linear dimension annotations showing the grid pitch.
     Uses DXF DIMENSION entities with the standard dimension style.
@@ -473,10 +475,10 @@ def export_dwg(result: PlacementResult, classified: ClassifiedPlan,
         ref.add_attrib("PRODUCT", lp.product_code, insert=(lp.x, lp.y - lp.cutout_mm))
 
     # ── Ceiling tile grid (tile boundaries — lights at cell centres) ──────
-    _draw_ceiling_grid(msp, classified)
+    _draw_ceiling_grid(msp, classified, pitch_mm=625.0)
 
     # ── Dimension annotations ──────────────────────────────────────────────
-    _draw_dimensions(msp, result)
+    _draw_dimensions(msp, result, pitch_mm=625.0)
 
     # ── Legend (top-right of drawing) ─────────────────────────────────────
     if classified.zones:
@@ -557,17 +559,19 @@ def export_excel(result: PlacementResult, classified: ClassifiedPlan,
 
     summary_rows = [
         ("Total luminaires",               len(result.placed)),
-        ("A — K1 Regalbeleuchtung 15W 40°", len(result.by_type("A"))),
-        ("B — K4 Ergänzung 20W 60°",        len(result.by_type("B"))),
-        ("C — K3 Rand 15W 40°",             len(result.by_type("C"))),
-        ("D — K2 Checkout/Service 20W 40°", len(result.by_type("D"))),
-        ("E — K6 Schaufenster 20W 60°",     len(result.by_type("E"))),
-        ("W — Wabeneinsatz 20W 36°",        len(result.by_type("W"))),
-        ("P — K5 Plakate 16W 24°",          len(result.by_type("P"))),
-        ("Total connected load",            f"{result.total_wattage():.0f} W"),
-        ("W/m² density",                    f"{result.total_wattage()/max(sum(z.area_m2 for z in classified.zones),1):.2f} W/m²"),
-        ("Zones classified",                len(classified.zones)),
-        ("Grid pitch (Startmaß)",           "1250 mm"),
+        ("A — K1 Regalbeleuchtung 15W 40°",         len(result.by_type("A"))),
+        ("AW — K1 Außenwand Beam-M-high 20W 40°",  len(result.by_type("AW"))),
+        ("B — K4 Ergänzung 20W 60°",               len(result.by_type("B"))),
+        ("C — K3 Rand 15W 40°",                    len(result.by_type("C"))),
+        ("D — K2 Checkout/Service 20W 40°",        len(result.by_type("D"))),
+        ("E — K6 Schaufenster 20W 60°",            len(result.by_type("E"))),
+        ("W — Wabeneinsatz 20W 36°",               len(result.by_type("W"))),
+        ("P — K5 Plakate 16W 24°",                 len(result.by_type("P"))),
+        ("Total connected load",                   f"{result.total_wattage():.0f} W"),
+        ("W/m² density",                           f"{result.total_wattage()/max(sum(z.area_m2 for z in classified.zones),1):.2f} W/m²"),
+        ("Zones classified",                       len(classified.zones)),
+        ("Tile module (Referenzmaß Rasterdecke)",  "625 mm"),
+        ("Inter-luminaire spacing",                "1250 mm (2 tiles)"),
         ("Ceiling height (UK Rasterdecke)", "3000 mm"),
         ("Product family",                  "MIKA80-E + NEO85-SX (MAX FRANKE.led)"),
         ("Standard",                        "EN 12464-1 Lichtstrommethode"),
@@ -811,15 +815,17 @@ def export_pdf(result: PlacementResult, classified: ClassifiedPlan,
           for z in classified.zones]
 
     specs = [
-        ("Grid pitch (Startmaß Rasterdecke)", "1250 mm"),
-        ("Ceiling height (UK Rasterdecke)",   "3000 mm / Fries 3300 mm"),
-        ("A — K1 Regalbeleuchtung Innenraum", "MIKA80-E 15W 40° 2400lm"),
-        ("B — K4 Ergänzungsbeleuchtung",       "MIKA80-E 20W 60° 3200lm"),
-        ("C — K3 Regalbeleuchtung Rand",       "MIKA80-E 15W 40° 2400lm"),
-        ("D — K2 Checkout / Service",          "MIKA80-E 20W 40° 3200lm"),
-        ("E — K6 Schaufenster",                "NEO85-SX 20W 60° 3200lm Track"),
-        ("W — Wabeneinsatz Cosmetics",         "MIKA80-E 20W 36° 1700lm Honeycomb"),
-        ("P — K5 Plakate Poster",              "MIKA80-E 16W 24° 2100lm Power-Linse"),
+        ("Tile module (Referenzmaß Rasterdecke)", "625 mm"),
+        ("Inter-luminaire spacing (shelf runs)",  "1250 mm (2 tiles)"),
+        ("Ceiling height (UK Rasterdecke)",       "3000 mm / Fries 3300 mm"),
+        ("A — K1 Regalbeleuchtung Innenraum",    "MIKA80-E 15W 40° 2400lm"),
+        ("AW — K1 Außenwand Beam-M-high",        "MIKA80-E 20W 40° 3200lm"),
+        ("B — K4 Ergänzungsbeleuchtung",          "MIKA80-E 20W 60° 3200lm"),
+        ("C — K3 Regalbeleuchtung Rand",          "MIKA80-E 15W 40° 2400lm"),
+        ("D — K2 Checkout / Service",             "MIKA80-E 20W 40° 3200lm"),
+        ("E — K6 Schaufenster",                   "NEO85-SX 20W 60° 3200lm Track"),
+        ("W — Wabeneinsatz Cosmetics",            "MIKA80-E 20W 36° 1700lm Honeycomb"),
+        ("P — K5 Plakate Poster",                 "MIKA80-E 16W 24° 2100lm Power-Linse"),
         ("Cutout dia. (DA)",                   "128 mm  /  NEO85-SX: 85 mm"),
         ("Outer dia. (AD)",                    "140 mm  /  NEO85-SX: 85 mm"),
         ("Embed depth (EBT)",                  "110 mm  /  NEO85-SX: 146 mm"),

@@ -1,20 +1,25 @@
 """
 lighting-ai/main.py — master entry point.
 
-Three modes:
-  pipeline   Run the full pipeline on a plan file
-  api        Start the FastAPI server
-  train      Train / retrain the zone classifier
-  validate   Validate placement accuracy against a known output plan
+Modes:
+  pipeline      Run the full ML+geometric pipeline on a plan file
+  api           Start the FastAPI server
+  train         Train / retrain the ZONE classifier (room_classifier.pkl)
+  train-placer  Train / retrain the PLACEMENT classifier (placer_model.pkl)
+  validate      Validate placement accuracy against a known output plan
 
 Usage:
-  python main.py pipeline --file plan.pdf
-  python main.py pipeline --file plan.dwg --pdf-fallback plan.pdf
+  python main.py pipeline --file plan.dwg
   python main.py pipeline --demo
   python main.py api
   python main.py train --synthetic
-  python main.py train --from-reference --synthetic
+  python main.py train-placer --synthetic
+  python main.py train-placer --annotations data/annotations/placements.jsonl
   python main.py validate
+
+Environment:
+  COLLECT_TRAINING=1   (default) — save placement training data during pipeline runs
+  COLLECT_TRAINING=0   — disable training data collection (e.g. batch benchmarks)
 """
 from __future__ import annotations
 import argparse, sys
@@ -235,11 +240,65 @@ def run_train(synthetic=True, from_reference=False,
     print(f"\nModel trained on {len(X_all)} samples.")
 
 
+# ── Train placement model ─────────────────────────────────────────────────────
+
+def run_train_placer(synthetic=True, annotations=None, n_synthetic=400):
+    """Train the ML luminaire placement classifier (placer_model.pkl)."""
+    from ml.training.train_placer import (
+        _jsonl_to_arrays, generate_synthetic, train, feature_importance,
+        PLACEMENTS_JSONL,
+    )
+    import numpy as np
+    from services.placer.placement_features import FEATURE_DIM
+
+    X_all = np.empty((0, FEATURE_DIM), dtype=np.float32)
+    y_all: list = []
+
+    # Load accumulated placement samples from pipeline runs
+    ann_path = Path(annotations) if annotations else PLACEMENTS_JSONL
+    Xa, ya = _jsonl_to_arrays([ann_path])
+    if len(Xa):
+        X_all = np.vstack([X_all, Xa]) if len(X_all) else Xa
+        y_all.extend(ya)
+        print(f"Loaded {len(Xa)} real placement samples from {ann_path}")
+
+    if synthetic or len(X_all) < 200:
+        print(f"Adding synthetic training samples ({n_synthetic}/class) …")
+        Xs, ys = generate_synthetic(n_synthetic)
+        X_all = np.vstack([X_all, Xs]) if len(X_all) else Xs
+        y_all.extend(ys)
+
+    if len(X_all) == 0:
+        print("No training data. Run the pipeline first to generate placements.jsonl.")
+        return
+
+    clf = train(X_all, y_all)
+    feature_importance(clf)
+    print(f"\nPlacement model trained on {len(X_all)} samples.")
+
+
+# ── Auto-ensure models exist ──────────────────────────────────────────────────
+
+def _ensure_models():
+    """Bootstrap ML models on first run if they don't exist yet."""
+    from config import MODELS_DIR
+    zone_model = MODELS_DIR / "room_classifier.pkl"
+    placer_model = MODELS_DIR / "placer_model.pkl"
+
+    if not zone_model.exists():
+        print("[ML] Zone classifier not found — training with synthetic data …")
+        run_train(synthetic=True)
+
+    if not placer_model.exists():
+        print("[ML] Placement classifier not found — training with synthetic data …")
+        run_train_placer(synthetic=True)
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
     p = argparse.ArgumentParser(
-        description="lighting-ai — automated lighting design pipeline",
+        description="lighting-ai — automated ML lighting design pipeline",
         formatter_class=argparse.RawTextHelpFormatter)
     sub = p.add_subparsers(dest="mode", required=True)
 
@@ -264,21 +323,39 @@ def main():
     tp.add_argument("--corrections",    default=None)
     tp.add_argument("--n-per-class",    type=int, default=300)
 
+    # train-placer
+    plp = sub.add_parser("train-placer",
+                          help="Train ML placement classifier (placer_model.pkl)")
+    plp.add_argument("--synthetic",    action="store_true",
+                     help="Add synthetic samples when real data is scarce")
+    plp.add_argument("--annotations",  default=None,
+                     help="Path to placements.jsonl (default: data/annotations/placements.jsonl)")
+    plp.add_argument("--n-synthetic",  type=int, default=400,
+                     help="Synthetic samples per class")
+
     # validate
     sub.add_parser("validate", help="Validate vs real Rossmann EG plan")
 
     args = p.parse_args()
 
     if args.mode == "pipeline":
+        _ensure_models()
         run_pipeline(file_path=args.file, pdf_fallback=args.pdf_fallback,
                      concept_id=args.concept, project_name=args.project_name,
                      customer=args.customer, demo=args.demo)
     elif args.mode == "api":
+        _ensure_models()
         run_api()
     elif args.mode == "train":
         run_train(synthetic=args.synthetic, from_reference=args.from_reference,
                   annotations=args.annotations, corrections=args.corrections,
                   n_per_class=args.n_per_class)
+    elif args.mode == "train-placer":
+        run_train_placer(
+            synthetic   = args.synthetic,
+            annotations = args.annotations,
+            n_synthetic = args.n_synthetic,
+        )
     elif args.mode == "validate":
         run_validate()
 

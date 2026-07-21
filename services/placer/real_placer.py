@@ -3,20 +3,39 @@ lighting-ai/services/placer/real_placer.py
 
 Luminaire placer for real Rossmann plans.
 
-Algorithm:
-  1. Compute per-zone lighting specification (EN 12464-1 lumen method).
-     Each zone type has a target lux level; room dimensions determine the
-     Room Index k, which drives the utilisation factor η and therefore the
-     required luminaire count n and optimal grid spacing.
-  2. Shelf-guided placement for sales floors with sufficient shelf data.
-     Falls back to uniform lux-calculated grid when shelf data is sparse.
-  3. Inner nodes → Type A (15W 40°), perimeter nodes → Type B (20W 60°).
-  4. Special positions: Type C (accent), D (IP44 entrance), E (pendant).
-  5. All candidate points checked against exclusion zones.
-  6. Grid origin read from plan.grid_origin_mm (auto-detected or from LISP).
+Architecture (from technical documents):
+  The task is NOT free coordinate generation.  It is:
+    "Selection and typing of legal luminaire positions on a known ceiling grid."
+
+  Four-layer decision logic:
+    1. Candidate generation   — tessellate 625mm grid, extract shelf-row positions
+    2. Candidate scoring      — shelf proximity, wall relation, assortment context
+    3. Selection              — hard rules first, soft spacing preferences
+    4. Write-back             — correct block/layer/type per Rossmann profile
+
+Grid facts (from DXF semantic audit):
+  • Tile module: 625mm × 625mm
+  • A_center sub-position: luminaire at tile centre (312.5, 312.5) within tile
+  • B_corner sub-position: luminaire at corner offset (150, 150) within tile
+  • Typical inter-luminaire spacing: 1250mm = 2 tiles along shelf run
+  • Exterior-wall shelves (≤ 625mm from outer contour) → Beam-M-high luminaire
+  • Interior shelves → Beam-M-standard luminaire
+
+Luminaire type mapping (from DXF semantic audit of Bad Nenndorf output):
+  A  (*U1528) — MIKA80-E 40° Beam-M-600ma — interior shelf standard
+  AW (*U1549) — MIKA80-E 40° Beam-M-high  — exterior / wall-boundary shelf
+  B  (*U1546) — MIKA80-E 60° Beam-F-3200  — wide-beam supplement / fill
+  D  (*U1545) — MIKA80-E 60° Beam-F-3200  — checkout-area task lighting
+  E  (*U1548) — track spotlight            — shop window / Schaufenster
+  C  — relabelled corner A-lights (3 per plan, at shelf-domain corners)
+  W  — anti-glare honeycomb for cosmetics areas
+
+Position class counts in Bad Nenndorf reference (DXF audit ground truth):
+  Aufteilung-A: 130   Aufteilung_B: 37   Aufteilung_D: 34
+  Aufteilung_E: 18    Aufteilung_C: 3
 """
 from __future__ import annotations
-import json, math
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -34,92 +53,236 @@ from services.lighting.calculator import (
     NO_LIGHTING_ZONE_TYPES, LUMINAIRE_CATALOG,
     ZONE_LIGHTING_STRATEGY,
 )
+from services.grid.ceiling_grid import (
+    TILE_MM, INTER_LUMINAIRE_MM,
+    generate_shelf_row_candidates,
+    generate_area_candidates,
+    classify_wall_relation,
+    snap_to_grid, snap_to_subposition,
+)
+from services.placer.placement_features import (
+    extract as _extract_features,
+    WALL_ASSORTMENT_NAMES as _WALL_ASSORT_NAMES,
+)
 
-# ── Calibrated geometry constants ─────────────────────────────────────────────
-PITCH_MM        = BASE_PITCH   # 1250 — Rossmann Startmaß (fallback)
+# ── Grid / geometry constants ─────────────────────────────────────────────────
+
+PITCH_MM        = TILE_MM          # 625mm — fundamental ceiling tile
+INTER_LUMI_MM   = INTER_LUMINAIRE_MM  # 1250mm — typical inter-luminaire spacing
 HULL_BUFFER_MM  = 1025
 PERIM_SHRINK_MM = 1600
 OUTPUT_SCALE    = 75
 COS_A=-0.0176; SIN_A=-0.9998; TX_MM=3930.0; TY_MM=59414.0
 
-# ── Luminaire type specs ──────────────────────────────────────────────────────
-# All types sourced from the Rossmann Hamburg Jungfernstieg 3600 lighting plans
-# (MAX FRANKE.led, Jan 2026).  K-codes match the plan legend categories.
+# ── Luminaire type catalog ────────────────────────────────────────────────────
+#
+# A   (*U1528) — MIKA80-E 40° Beam-M-600ma  — interior shelf standard (178 in BN)
+# AW  (*U1549) — MIKA80-E 40° Beam-M-high   — exterior / wall shelf   (38 in BN)
+# B   (*U1546) — MIKA80-E 60° Beam-F-3200   — wide-beam supplement
+# D   (*U1545) — MIKA80-E 60° checkout      — task lighting at checkout
+# E   (*U1548) — track spotlight             — Schaufenster
+# C   — same spec as A, relabelled at shelf-domain corners
+# W   — anti-glare honeycomb (cosmetics areas)
+# P   — narrow 24° poster accent
 
-TYPE_A = dict(product_code="MIKA80-E-WS-930-PH-PS7HE+-L22-2400-40RF-DV2.5-EN*",
-              description="MIKA80-E K1 Regalbeleuchtung 15W 40° 2400lm 3000K",
-              manufacturer="MAX FRANKE.led", wattage=15, lux_output=2400,
-              mounting_type="grid_recessed", cutout_mm=128, embed_depth_mm=110,
-              ip_rating="IP20", dimmable=True, cri=90, cct_k=3000,
-              beam_angle_deg=40.0, lumi_type="A")
+TYPE_A = dict(
+    product_code  = "MIKA80-E-WS-930-PH-PS7HE+-L22-2400-40RF-DV2.5-EN*",
+    description   = "MIKA80-E K1 Regalbeleuchtung 15W 40° 2400lm 3000K",
+    manufacturer  = "MAX FRANKE.led",
+    wattage=15, lux_output=2400, beam_angle_deg=40.0,
+    mounting_type = "grid_recessed", cutout_mm=128, embed_depth_mm=110,
+    ip_rating="IP20", dimmable=True, cri=90, cct_k=3000, lumi_type="A")
 
-# K4 — wide-angle supplemental fill (areas not covered by shelf-guided K1)
-TYPE_B = dict(product_code="MIKA80-E-WS-930-PH-PS7HE+-L22-3200-60RF-DV2.5-EN*",
-              description="MIKA80-E K4 Ergänzungsbeleuchtung 20W 60° 3200lm 3000K",
-              manufacturer="MAX FRANKE.led", wattage=20, lux_output=3200,
-              mounting_type="grid_recessed", cutout_mm=128, embed_depth_mm=110,
-              ip_rating="IP20", dimmable=True, cri=90, cct_k=3000,
-              beam_angle_deg=60.0, lumi_type="B")
+# Exterior-wall / wall-boundary shelf luminaire (Beam-M-high driver)
+TYPE_AW = dict(
+    product_code  = "MIKA80-E-WS-930-PH-PS7HE+-L22-high-40RF-DV2.5-EN*",
+    description   = "MIKA80-E K1 Regal Außenwand 40° Beam-M-high 3000K",
+    manufacturer  = "MAX FRANKE.led",
+    wattage=20, lux_output=3200, beam_angle_deg=40.0,
+    mounting_type = "grid_recessed", cutout_mm=128, embed_depth_mm=110,
+    ip_rating="IP20", dimmable=True, cri=90, cct_k=3000, lumi_type="AW")
 
-# K3 — shelf edge / perimeter rows (same physical spec as K1, different position)
-TYPE_C = dict(product_code="MIKA80-E-WS-930-PH-PS7HE+-L22-2400-40RF-DV2.5-EN*",
-              description="MIKA80-E K3 Regalbeleuchtung Rand 15W 40° 2400lm 3000K",
-              manufacturer="MAX FRANKE.led", wattage=15, lux_output=2400,
-              mounting_type="grid_recessed", cutout_mm=128, embed_depth_mm=110,
-              ip_rating="IP20", dimmable=True, cri=90, cct_k=3000,
-              beam_angle_deg=40.0, lumi_type="C")
+TYPE_B = dict(
+    product_code  = "MIKA80-E-WS-930-PH-PS7HE+-L22-3200-60RF-DV2.5-EN*",
+    description   = "MIKA80-E K4 Ergänzungsbeleuchtung 20W 60° 3200lm 3000K",
+    manufacturer  = "MAX FRANKE.led",
+    wattage=20, lux_output=3200, beam_angle_deg=60.0,
+    mounting_type = "grid_recessed", cutout_mm=128, embed_depth_mm=110,
+    ip_rating="IP20", dimmable=True, cri=90, cct_k=3000, lumi_type="B")
 
-# K2 — stronger 40° downlight for checkout counters and service areas
-TYPE_D = dict(product_code="MIKA80-E-WS-930-PH-PS7HE+-L22-3200-40RF-DV2.5-EN*",
-              description="MIKA80-E K2 Checkout/Service 20W 40° 3200lm 3000K",
-              manufacturer="MAX FRANKE.led", wattage=20, lux_output=3200,
-              mounting_type="grid_recessed", cutout_mm=128, embed_depth_mm=110,
-              ip_rating="IP20", dimmable=True, cri=90, cct_k=3000,
-              beam_angle_deg=40.0, lumi_type="D")
+TYPE_C = dict(
+    product_code  = "MIKA80-E-WS-930-PH-PS7HE+-L22-2400-40RF-DV2.5-EN*",
+    description   = "MIKA80-E K3 Regalbeleuchtung Rand 15W 40° 2400lm 3000K",
+    manufacturer  = "MAX FRANKE.led",
+    wattage=15, lux_output=2400, beam_angle_deg=40.0,
+    mounting_type = "grid_recessed", cutout_mm=128, embed_depth_mm=110,
+    ip_rating="IP20", dimmable=True, cri=90, cct_k=3000, lumi_type="C")
 
-# K6 — NEO85-SX track spotlight for window display (Schaufenster)
-TYPE_E = dict(product_code="NEO85-SX-WS-930-PH-PS7HE+-L22-3200-60RF-EN+",
-              description="NEO85-SX K6 Schaufenster-Strahler 20W 60° 3200lm Track",
-              manufacturer="MAX FRANKE.led", wattage=20, lux_output=3200,
-              mounting_type="track_3phase", cutout_mm=85, embed_depth_mm=146,
-              ip_rating="IP20", dimmable=True, cri=90, cct_k=3000,
-              beam_angle_deg=60.0, lumi_type="E")
+TYPE_D = dict(
+    product_code  = "MIKA80-E-WS-930-PH-PS7HE+-L22-3200-40RF-DV2.5-EN*",
+    description   = "MIKA80-E K2 Checkout/Service 20W 40° 3200lm 3000K",
+    manufacturer  = "MAX FRANKE.led",
+    wattage=20, lux_output=3200, beam_angle_deg=40.0,
+    mounting_type = "grid_recessed", cutout_mm=128, embed_depth_mm=110,
+    ip_rating="IP20", dimmable=True, cri=90, cct_k=3000, lumi_type="D")
 
-# Wabeneinsatz — honeycomb anti-glare for cosmetics and glare-sensitive areas
-TYPE_W = dict(product_code="MIKA80-E-WS-930-PH-PS7HE+-L22-1700-36PP-W-DV2.5-EN*",
-              description="MIKA80-E Wabeneinsatz 20W 36° 1700lm Anti-Glare 3000K",
-              manufacturer="MAX FRANKE.led", wattage=20, lux_output=1700,
-              mounting_type="grid_recessed", cutout_mm=128, embed_depth_mm=110,
-              ip_rating="IP20", dimmable=True, cri=90, cct_k=3000,
-              beam_angle_deg=36.0, lumi_type="W")
+TYPE_E = dict(
+    product_code  = "NEO85-SX-WS-930-PH-PS7HE+-L22-3200-60RF-EN+",
+    description   = "NEO85-SX K6 Schaufenster-Strahler 20W 60° 3200lm Track",
+    manufacturer  = "MAX FRANKE.led",
+    wattage=20, lux_output=3200, beam_angle_deg=60.0,
+    mounting_type = "track_3phase", cutout_mm=85, embed_depth_mm=146,
+    ip_rating="IP20", dimmable=True, cri=90, cct_k=3000, lumi_type="E")
 
-# K5 Plakate — narrow 24° power-lens for poster / promotional banner illumination
-TYPE_P = dict(product_code="MIKA80-E-WS-930-PH-PS7HE+-L15-2100-24PP-DV2.5-EN*",
-              description="MIKA80-E K5 Plakate 16W 24° 2100lm Power-Linse 3000K",
-              manufacturer="MAX FRANKE.led", wattage=16, lux_output=2100,
-              mounting_type="grid_recessed", cutout_mm=128, embed_depth_mm=110,
-              ip_rating="IP20", dimmable=True, cri=90, cct_k=3000,
-              beam_angle_deg=24.0, lumi_type="P")
+TYPE_W = dict(
+    product_code  = "MIKA80-E-WS-930-PH-PS7HE+-L22-1700-36PP-W-DV2.5-EN*",
+    description   = "MIKA80-E Wabeneinsatz 20W 36° 1700lm Anti-Glare 3000K",
+    manufacturer  = "MAX FRANKE.led",
+    wattage=20, lux_output=1700, beam_angle_deg=36.0,
+    mounting_type = "grid_recessed", cutout_mm=128, embed_depth_mm=110,
+    ip_rating="IP20", dimmable=True, cri=90, cct_k=3000, lumi_type="W")
 
-SHELF_LABELS = {'57','47','77','37','67','27','57/47','47/37','77/57','57/37'}
+TYPE_P = dict(
+    product_code  = "MIKA80-E-WS-930-PH-PS7HE+-L15-2100-24PP-DV2.5-EN*",
+    description   = "MIKA80-E K5 Plakate 16W 24° 2100lm Power-Linse 3000K",
+    manufacturer  = "MAX FRANKE.led",
+    wattage=16, lux_output=2100, beam_angle_deg=24.0,
+    mounting_type = "grid_recessed", cutout_mm=128, embed_depth_mm=110,
+    ip_rating="IP20", dimmable=True, cri=90, cct_k=3000, lumi_type="P")
 
-# ── Shelf height code extractor ───────────────────────────────────────────────
+_TYPE_MAP = {
+    'A': TYPE_A, 'AW': TYPE_AW, 'B': TYPE_B, 'C': TYPE_C,
+    'D': TYPE_D, 'E': TYPE_E,   'W': TYPE_W, 'P': TYPE_P,
+}
 
-def _shelf_height_code(fi) -> str:
+# ── ML placement model (loaded once) ─────────────────────────────────────────
+import os as _os, pickle as _pickle
+from config import MODELS_DIR as _MODELS_DIR, ANNOTATIONS_DIR as _ANNO_DIR
+
+_PLACER_MODEL      = None
+_PLACER_MODEL_PATH = _MODELS_DIR / "placer_model.pkl"
+_COLLECT_TRAINING  = _os.environ.get("COLLECT_TRAINING", "1") == "1"
+
+def _load_placer_model():
+    global _PLACER_MODEL
+    if _PLACER_MODEL is None and _PLACER_MODEL_PATH.exists():
+        try:
+            with open(_PLACER_MODEL_PATH, 'rb') as _f:
+                _PLACER_MODEL = _pickle.load(_f)
+        except Exception:
+            _PLACER_MODEL = None
+    return _PLACER_MODEL
+
+def _ml_predict_type(features_vec) -> str | None:
     """
-    Return the Rossmann shelf height code for a FurnitureInsert.
-
-    PDF parser sets block_name = 'SHELF_57', 'SHELF_47', etc.
-    DWG parser embeds the code in the block name: 'T57m_14', 'I1_47_29', etc.
+    Predict luminaire type from feature vector.
+    Returns type string ('A', 'AW', 'C', 'E') or None if model unavailable.
     """
-    import re as _re
-    bn = fi.block_name
-    if bn.startswith('SHELF_'):
-        return bn[6:]          # strip prefix → '57', '47/37', etc.
-    parts = set(_re.split(r'[^0-9]+', bn))
-    for code in ('77', '67', '57', '47', '37', '27'):
-        if code in parts:
-            return code
+    clf = _load_placer_model()
+    if clf is None:
+        return None
+    import numpy as np
+    try:
+        pred = clf.predict(features_vec.reshape(1, -1))[0]
+        return pred if pred != 'skip' else None
+    except Exception:
+        return None
+
+def _save_training_sample(features_vec, lumi_type: str):
+    """Append one (features, lumi_type) pair to the placement training JSONL."""
+    if not _COLLECT_TRAINING:
+        return
+    try:
+        _ANNO_DIR.mkdir(parents=True, exist_ok=True)
+        path = _ANNO_DIR / "placements.jsonl"
+        import json as _json
+        with open(path, 'a') as _f:
+            _f.write(_json.dumps({
+                "features":   features_vec.tolist(),
+                "lumi_type":  lumi_type,
+            }) + "\n")
+    except Exception:
+        pass
+
+
+import re as _re_placer
+
+def _parse_depth_mm_p(depth_code: str) -> int:
+    """Extract first numeric depth value from code like '57/47' → 57."""
+    m = _re_placer.match(r'(\d+)', depth_code or '')
+    return int(m.group(1)) if m else 0
+
+
+def _build_shelf_exclusion(shelf_objs: list, pitch: float = PITCH_MM):
+    """
+    Return a Shapely union polygon covering all shelf gondola bodies.
+
+    Each shelf INSERT is approximated as a rectangle:
+      • Along-run: pitch (625mm — one module width)
+      • Perpendicular: depth_code × 10 mm (shelf depth, default 470mm)
+
+    Used to filter luminaire candidates that would land inside a gondola body
+    rather than in the ceiling grid above the aisle.
+    """
+    from shapely.geometry import box as _shbox
+    from shapely.ops import unary_union as _uu
+    polys = []
+    for f in shelf_objs:
+        depth_mm = _parse_depth_mm_p(getattr(f, 'depth_code', '') or '') * 10
+        if depth_mm <= 0:
+            depth_mm = 470   # typical Rossmann gondola depth
+        rot     = getattr(f, 'rotation', 0.0) % 180
+        sx, sy  = f.position
+        half_d  = depth_mm / 2.0
+        half_w  = pitch / 2.0
+        if rot < 45 or rot > 135:   # horizontal shelf: depth along Y
+            polys.append(_shbox(sx - half_w, sy - half_d, sx + half_w, sy + half_d))
+        else:                        # vertical shelf: depth along X
+            polys.append(_shbox(sx - half_d, sy - half_w, sx + half_d, sy + half_w))
+    if not polys:
+        return None
+    return _uu(polys)
+
+
+def _shelf_wall_signal(cx: float, cy: float, shelf_objs: list,
+                       envelope, cap_mm: float = 2500.0) -> str:
+    """
+    Determine wall relation from the nearest shelf's assortment and depth code.
+
+    Returns:
+      'exterior_wall' — depth >= 67mm OR assortment is a known wall category
+      'interior'      — known non-wall assortment + standard depth + far from wall
+      ''              — no confident signal; defer to geometric classification
+
+    This overrides the purely geometric wall detection which can be wrong for:
+      • Shallow-depth wall assortments (PARFÜM 47mm, KONSUMDUFT 47mm)
+      • Interior gondolas near zone boundaries in compact stores (Bad Nenndorf)
+    """
+    best_d, best_s = cap_mm, None
+    for s in shelf_objs:
+        ox, oy = s.position[0], s.position[1]
+        d = math.sqrt((cx - ox) ** 2 + (cy - oy) ** 2)
+        if d < best_d:
+            best_d, best_s = d, s
+    if best_s is None:
+        return ''
+    depth_mm = _parse_depth_mm_p(getattr(best_s, 'depth_code', ''))
+    assort   = getattr(best_s, 'assortment', '').strip().upper()
+    # Strong wall indicators — always AW regardless of geometry
+    if depth_mm >= 67:
+        return 'exterior_wall'
+    # Wall assortment: only promote to exterior_wall when real envelope geometry is
+    # available.  Without it (PDF input), sales_area_poly.boundary is used as the
+    # exterior wall proxy; the assortment signal would fire for interior gondolas
+    # that carry wall-category products (WPR, PARFÜM etc.), overcounting AW by 3×.
+    if assort in _WALL_ASSORT_NAMES and envelope is not None:
+        return 'exterior_wall'
+    # Confirmed interior: known non-wall assortment + standard depth + far from wall
+    if depth_mm > 0 and depth_mm < 67 and assort and assort not in _WALL_ASSORT_NAMES:
+        if envelope is not None:
+            env_dist = Point(cx, cy).distance(envelope.boundary)
+            if env_dist > 1250:   # more than 2 tiles from actual building wall
+                return 'interior'
     return ''
 
 
@@ -127,16 +290,18 @@ def _shelf_height_code(fi) -> str:
 
 @dataclass
 class PlacedLuminaire:
-    x:float; y:float; product_code:str; description:str; manufacturer:str
-    wattage:float; lux_output:float; zone_type:str; mounting_type:str; lumi_type:str
-    cutout_mm:float=128.0; embed_depth_mm:float=110.0; ip_rating:str="IP20"
-    dimmable:bool=True; cri:int=90; cct_k:int=3000; beam_angle_deg:float=40.0
-    rotation:float=0.0; grid_snapped:bool=True; shelf_aligned:bool=True
+    x: float; y: float
+    product_code: str; description: str; manufacturer: str
+    wattage: float; lux_output: float; zone_type: str
+    mounting_type: str; lumi_type: str
+    cutout_mm: float = 128.0; embed_depth_mm: float = 110.0
+    ip_rating: str = "IP20"; dimmable: bool = True
+    cri: int = 90; cct_k: int = 3000; beam_angle_deg: float = 40.0
+    rotation: float = 0.0; grid_snapped: bool = True; shelf_aligned: bool = True
 
 
 @dataclass
 class ZoneLightingReport:
-    """Per-zone lighting calculation result stored on PlacementResult."""
     zone_type:           str
     area_m2:             float
     room_width_m:        float
@@ -148,12 +313,11 @@ class ZoneLightingReport:
     required_count:      int
     placed_count:        int
     grid_pitch_mm:       int
-    maintained_lux:      float   # achieved Em with actual placed count
+    maintained_lux:      float
     luminaire_type:      str
     luminaire_flux_lm:   int
 
     def maintained_lux_actual(self) -> float:
-        """Recalculate Em from the actual placed_count."""
         A = self.area_m2
         if A <= 0:
             return 0.0
@@ -177,7 +341,7 @@ class PlacementResult:
     source_file: str
     placed:       list = field(default_factory=list)
     corrections:  list = field(default_factory=list)
-    zone_reports: list = field(default_factory=list)  # list[ZoneLightingReport]
+    zone_reports: list = field(default_factory=list)
 
     def total_wattage(self): return sum(p.wattage for p in self.placed)
     def by_type(self, t):    return [p for p in self.placed if p.lumi_type == t]
@@ -192,7 +356,7 @@ class PlacementResult:
 
     def lighting_report(self) -> str:
         lines = [
-            "Zone Lighting Report (EN 12464-1 Lumen Method)",
+            "Zone Lighting Report",
             f"{'Zone':16s} {'Area':>7s} {'k':>5s} {'η':>5s} "
             f"{'Pitch':>6s} {'Req':>4s} {'Placed':>6s} {'Em':>6s} {'Target':>7s}",
             "-" * 75,
@@ -210,12 +374,7 @@ class PlacementResult:
         return "\n".join(lines)
 
 
-# ── Geometry helpers ──────────────────────────────────────────────────────────
-
-_TYPE_MAP = {
-    'A': TYPE_A, 'B': TYPE_B, 'C': TYPE_C,
-    'D': TYPE_D, 'E': TYPE_E, 'W': TYPE_W, 'P': TYPE_P,
-}
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make(x, y, zone_type, lumi_type, shelf_aligned=True, **kw) -> PlacedLuminaire:
     spec = _TYPE_MAP.get(lumi_type, TYPE_A).copy()
@@ -228,8 +387,8 @@ def _snap(x, y, pitch, ox, oy):
     return round((x - ox) / pitch) * pitch + ox, round((y - oy) / pitch) * pitch + oy
 
 
-def _grid_pts(polygon, pitch, ox, oy, clr=400):
-    """Generate all ceiling-grid points that fall inside *polygon* (inset by clr mm)."""
+def _grid_pts(polygon, pitch, ox, oy, clr=300):
+    """Generate grid points at `pitch` spacing that fall inside *polygon*."""
     inset = polygon.buffer(-clr)
     if inset.is_empty:
         inset = polygon
@@ -255,12 +414,29 @@ def _is_excluded(x, y, exclusion_zones: list) -> bool:
     return any(ez.contains(pt) for ez in exclusion_zones)
 
 
+def _mad_filter(shelf_objs):
+    """Reject shelf positions that are extreme statistical outliers (MAD × 8)."""
+    if len(shelf_objs) < 3:
+        return shelf_objs
+    s_xs = sorted(f.position[0] for f in shelf_objs)
+    s_ys = sorted(f.position[1] for f in shelf_objs)
+    mid  = len(s_xs) // 2
+    med_x, med_y = s_xs[mid], s_ys[mid]
+    mad_x = max(sorted(abs(x - med_x) for x in s_xs)[mid], 500.0)
+    mad_y = max(sorted(abs(y - med_y) for y in s_ys)[mid], 500.0)
+    filtered = [f for f in shelf_objs
+                if abs(f.position[0] - med_x) <= 8 * mad_x
+                and abs(f.position[1] - med_y) <= 8 * mad_y]
+    return filtered or shelf_objs
+
+
 def _out_to_in(ox_mm, oy_mm):
     dx = ox_mm - TX_MM; dy = oy_mm - TY_MM
     return COS_A * dx + SIN_A * dy, -SIN_A * dx + COS_A * dy
 
 
 def _build_hull(calib_path: Optional[Path] = None):
+    import json
     if calib_path and calib_path.exists():
         d    = json.loads(calib_path.read_text())
         hull = Polygon([(c[0], c[1]) for c in d['hull_coords_mm']])
@@ -310,6 +486,7 @@ def _hull_from_pdf(pdf_path):
 
     calib_dir = Path(__file__).parent.parent.parent / "data/annotations"
     calib_dir.mkdir(parents=True, exist_ok=True)
+    import json
     json.dump({
         "hull_coords_mm": [[round(x,1), round(y,1)] for x, y in hull.exterior.coords],
         "hull_buffer_mm": HULL_BUFFER_MM, "perimeter_shrink_mm": PERIM_SHRINK_MM,
@@ -330,40 +507,30 @@ class RealLuminairePlacer:
 
     def place_all(self, plan: ParsedPlan, classified: ClassifiedPlan,
                   active_zone_types='all') -> PlacementResult:
-        """
-        Place luminaires in every zone using per-zone EN 12464-1 calculations.
-
-        active_zone_types — set of zone type strings, or the string 'all'.
-        """
-        # Grid origin: auto-detected from drawing > Rossmann Startmaß from zone bounds > last resort
-        # IMPORTANT: plan.bounds may equal the full drawing-sheet extent (including title block).
-        # Always derive the grid origin from the sales_floor zone polygon bounds — that polygon
-        # was selected by the classifier to match the actual building footprint.
+        # Grid origin: from plan (auto-detected from MF_Raster or set by annotation)
         grid_origin = getattr(plan, 'grid_origin_mm', (0.0, 0.0))
         if grid_origin != (0.0, 0.0):
             ox, oy = grid_origin
         else:
-            # If the plan is in a real-world (georeferenced) coordinate system
-            # — absolute values > 10 km — the DXF origin (0,0) already gives the
-            # correct 1250mm modular alignment.  Do not shift to zone bounds.
             sf_z = next((z for z in classified.zones if z.zone_type == 'sales_floor'), None)
             if sf_z is None:
                 sf_z = max(classified.zones, key=lambda z: z.area_m2) if classified.zones else None
             georef = (sf_z is not None and
                       any(abs(c) > 10_000_000 for c in sf_z.polygon.bounds))
             if georef:
-                ox, oy = 0.0, 0.0   # keep DXF origin — correct modular grid
+                ox, oy = 0.0, 0.0
             elif sf_z is not None:
                 zb = sf_z.polygon.bounds
-                ox = zb[0] + 1000.0   # Rossmann Startmaß: 1.00m from left wall
-                oy = zb[1] + 2000.0   # Rossmann Startmaß: 2.00m from bottom wall
+                ox = zb[0] + 1000.0
+                oy = zb[1] + 2000.0
             elif getattr(plan, 'bounds', None):
                 ox = plan.bounds[0] + 1000.0
                 oy = plan.bounds[1] + 2000.0
             else:
                 ox, oy = 1160.0, 500.0
-        base_pitch = int(getattr(plan, 'grid_pitch_mm', PITCH_MM) or PITCH_MM)
-        ceiling_mm = int(getattr(plan, 'ceiling_height_mm', 3000) or 3000)
+
+        base_pitch  = PITCH_MM           # 625mm tile — hard-configured
+        ceiling_mm  = int(getattr(plan, 'ceiling_height_mm', 3000) or 3000)
 
         result   = PlacementResult(source_file=plan.source_file)
         excl     = getattr(plan, 'exclusion_zones', [])
@@ -372,43 +539,31 @@ class RealLuminairePlacer:
         for zone in classified.zones:
             zt = zone.zone_type
 
-            # Zone filter
             if active_zone_types != 'all' and zt not in active_zone_types:
                 continue
 
-            # ── Zones that never receive ceiling luminaires ────────────────
-            # Sources: plan annotation "Direkte Beleuchtung nicht möglich"
-            # (Windfang), structural exclusions (Rolltreppe, Aufzug), and
-            # out-of-scope areas (WC, Technik).
             if zt in NO_LIGHTING_ZONE_TYPES:
                 continue
 
-            # Skip rooms too small to warrant dedicated luminaires
             if zone.area_m2 < 10:
                 continue
-            # Skip non-sales zones that overlap heavily with the calibrated hull
+
             if zt != 'sales_floor' and self._hb is not None:
                 frac = (self._hb.intersection(zone.polygon).area /
                         max(zone.polygon.area, 1))
                 if frac > 0.4:
                     continue
 
-            # ── Per-zone EN 12464-1 calculation ──────────────────────────────
             spec = _zone_spec(
                 zt, zone.area_m2, zone.polygon.bounds,
                 ceiling_mm=getattr(zone, 'ceiling_height_mm', ceiling_mm),
                 base_pitch=base_pitch,
             )
             zone_pitch = spec.grid_pitch_mm
-            # Checkout always runs on the standard ceiling grid (1250 mm) regardless
-            # of what the lumen method calculates — task lighting at every grid node.
+
             if zt == 'checkout_zone':
-                zone_pitch = base_pitch
-                # Mis-detection guard: if the checkout zone centroid is > 20 m from the
-                # nearest shelf position, it was likely detected from a legend / detail
-                # block drawn far from the actual store footprint.  Skip it silently.
-                # Use envelope-filtered shelf positions so phantom TEXT shelves in the
-                # title block cannot act as false anchors near a misdetected checkout zone.
+                zone_pitch = INTER_LUMI_MM   # 1250mm standard for checkout
+                # Mis-detection guard
                 shelf_positions = [f.position for f in plan.furniture
                                    if f.inferred_type == 'shelving']
                 if envelope is not None:
@@ -420,28 +575,39 @@ class RealLuminairePlacer:
                     from shapely.geometry import MultiPoint as _MP
                     nearest_shelf_dist = zone.polygon.centroid.distance(
                         _MP(shelf_positions))
-                    if nearest_shelf_dist > 20_000:   # 20 m in mm
+                    if nearest_shelf_dist > 20_000:
                         result.corrections.append(
                             f"Checkout zone skipped: centroid is "
-                            f"{nearest_shelf_dist/1000:.0f}m from nearest shelf "
-                            f"(likely a legend/detail block)")
+                            f"{nearest_shelf_dist/1000:.0f}m from nearest shelf")
                         continue
 
-            # For sales floor: exclude task-lighting sub-zones (checkout, service)
-            # so those positions receive D lights only, not A/B/C on top.
             effective_excl = excl[:]
             if zt == 'sales_floor':
                 for other in classified.zones:
-                    if other.zone_type in ('checkout_zone', 'service_area', 'office'):
+                    if other.zone_type in ('checkout_zone', 'service_area',
+                                           'office', 'storage'):
                         effective_excl.append(other.polygon)
+            elif zt == 'checkout_zone':
+                # Prevent D-lights from spilling into the shelf-occupied sales floor.
+                # ONLY add the exclusion when the checkout zone is mostly OUTSIDE
+                # the sales floor (i.e. a truly separate zone).  When checkout is
+                # largely inside the sales floor polygon (> 40% overlap — common in
+                # Rossmann layouts where checkouts sit at the front of the sales
+                # floor), adding the whole sales-floor polygon as exclusion would
+                # wipe out all D-light candidates.
+                for other in classified.zones:
+                    if other.zone_type == 'sales_floor':
+                        checkout_area = zone.polygon.area
+                        if checkout_area > 0:
+                            overlap = zone.polygon.intersection(other.polygon).area
+                            if overlap / checkout_area < 0.4:
+                                effective_excl.append(other.polygon)
 
-            # Place luminaires using zone-specific pitch
             placed_before = len(result.placed)
             result.placed.extend(
                 self._place_zone(zone, plan, effective_excl, zone_pitch, ox, oy))
             placed_count = len(result.placed) - placed_before
 
-            # Record calculation report for this zone
             result.zone_reports.append(ZoneLightingReport(
                 zone_type          = zt,
                 area_m2            = zone.area_m2,
@@ -460,21 +626,45 @@ class RealLuminairePlacer:
             ))
 
         # ── Building-envelope boundary guard ─────────────────────────────────
-        # Use the ACTUAL building wall polygon (pre-computed in the parser from
-        # room polylines) as the hard outer limit.  Unlike the old zone-polygon
-        # union (which could bleed through walls), the building envelope is the
-        # literal store footprint.  A 2 m buffer tolerates grid-snap rounding at
-        # the wall edge.
+        # Guard must use REAL wall geometry only — not synthetic zone polygons.
+        # Synthetic zones (especially checkout, built from furniture + 2500mm buffer)
+        # extend outside actual walls and defeat the guard if included.
         #
-        # Checkout zones live in the entrance vestibule, which is attached to the
-        # building but outside the main sales-floor envelope polygon.  Add them to
-        # the valid area explicitly so their D-lights pass the guard.
+        # Priority:
+        #   1. building_envelope  — detected from actual DXF closed polylines (best)
+        #   2. plan.room_polygons — all closed LWPOLYLINE shapes from the DXF
+        #   3. zone polygons derived from actual DXF room shapes (method = 'label'/'rule')
+        from shapely.ops import unary_union as _uu
+        _guard_polys = []
         if envelope is not None:
-            from shapely.ops import unary_union as _uu
-            _guard_polys = [envelope.buffer(2000)]
-            for _z in classified.zones:
-                if _z.zone_type == 'checkout_zone':
-                    _guard_polys.append(_z.polygon.buffer(500))
+            _guard_polys.append(envelope.buffer(300))   # 300mm tolerance for wall-edge lights
+        # Add actual room polygons — but filter out:
+        #   - Drawing frames / title blocks (area > 1000 m²)
+        #   - Tiny furniture footprints (area < 5 m²) — shelf units, counter modules
+        _room_polys = [rp for rp in getattr(plan, 'room_polygons', [])
+                       if 5e6 <= rp.area <= 1000e6]
+        for _rp in _room_polys:
+            _guard_polys.append(_rp.buffer(200))
+        # Add the CONVEX HULL of all real rooms + envelope.  This fills in gaps that
+        # exist between named rooms in the DXF (e.g. SB checkout vestibule, Windfang)
+        # which are physically inside the building but have no own room polygon.
+        _hull_src = _room_polys[:]
+        if envelope is not None:
+            _hull_src.append(envelope)
+        if _hull_src:
+            _building_hull = _uu(_hull_src).convex_hull.buffer(500)
+            _guard_polys.append(_building_hull)
+        if not _guard_polys:
+            # Last resort: zone polygons that came from real DXF shapes, tight buffer.
+            # Skip for PDF input (source_file ends in .pdf) — zone polygons there are
+            # built from text labels and furniture; using them as wall boundaries would
+            # strip checkout D-lights that sit outside the sales-floor polygon.
+            _is_pdf = str(getattr(plan, 'source_file', '')).lower().endswith('.pdf')
+            if not _is_pdf:
+                for _z in classified.zones:
+                    if getattr(_z, 'method', '') in ('label', 'rule'):
+                        _guard_polys.append(_z.polygon.buffer(200))
+        if _guard_polys:
             _env_guard = _uu(_guard_polys)
             before = len(result.placed)
             result.placed = [l for l in result.placed
@@ -482,7 +672,7 @@ class RealLuminairePlacer:
             clipped = before - len(result.placed)
             if clipped > 0:
                 result.corrections.append(
-                    f"Envelope guard removed {clipped} lights outside building boundary")
+                    f"Boundary guard removed {clipped} lights outside floor-plan walls")
 
         return result
 
@@ -490,152 +680,197 @@ class RealLuminairePlacer:
                     excl: list, pitch: float, ox: float, oy: float) -> list:
         zt = zone.zone_type
         if zt == 'sales_floor':
-            return self._place_sales(zone, plan, excl, pitch, ox, oy)
+            return self._place_sales(zone, plan, excl, ox, oy)
         elif zt == 'checkout_zone':
             return self._place_checkout(zone, plan, excl, pitch, ox, oy)
         elif zt == 'storage':
-            return self._place_storage(zone, excl, pitch, ox, oy)
+            return self._place_storage(zone, excl, ox, oy)
         elif zt == 'display_window':
-            return self._place_display_window(zone, excl, pitch, ox, oy)
+            return self._place_display_window(zone, excl, ox, oy)
         elif zt in ('corridor', 'entrance'):
             return self._place_corridor(zone, excl, pitch, ox, oy)
         elif zt in ('service_area', 'office'):
             return self._place_service(zone, excl, pitch, ox, oy)
-        # Unknown / fallback
-        return self._place_grid_default(zone, excl, pitch, ox, oy)
+        return self._place_grid_default(zone, excl, INTER_LUMI_MM, ox, oy)
 
     # ── Sales floor ───────────────────────────────────────────────────────────
 
     def _place_sales(self, zone: ZoneResult, plan: ParsedPlan,
-                     excl: list, pitch: float, ox: float, oy: float) -> list:
+                     excl: list, ox: float, oy: float) -> list:
         """
-        Shelf-anchored placement: every light position is derived from a
-        detected shelf INSERT, never from a zone-polygon boundary.
+        Grid-based luminaire placement for the Verkaufsfläche.
 
-        A = one per unique shelf-snapped grid node
-        B = fill 4-connected neighbor nodes of A lights (aisle / perimeter fill)
-        E = up to 2 per structural column, within the shelf domain
-        C = relabel the 4 corner-nearest A lights
+        Core principle (from technical documents):
+          "Not: furniture A gets luminaire X.
+           But: every legal grid position is scored for every allowed type."
 
-        Lights cannot escape the store boundary because they only exist where
-        shelves — or their immediate ceiling-tile neighbors — are detected.
-        No wall polygon, no building envelope, no clipping required.
+        Algorithm:
+          1. Collect shelf INSERT objects; filter by building envelope + MAD
+          2. Group shelves by orientation (horizontal / vertical from block rotation)
+          3. For each shelf row: generate positions at 1250mm intervals
+             (every 2nd 625mm tile — the standard Rossmann inter-luminaire spacing)
+          4. Classify each position:
+             exterior wall (≤ 625mm from outer contour) → TYPE_AW (high beam)
+             interior                                   → TYPE_A  (standard)
+          5. B-lights: positions at the outer boundary of the A-light domain
+             (within 1 grid-step of the zone edge but NOT classified as AW)
+          6. C-lights: relabel 3 corner A-lights at the shelf-domain corners
+          7. E-lights: column-adjacent grid nodes
+          8. W-lights: replace with anti-glare variant at cosmetics label positions
         """
+        pitch = PITCH_MM        # 625mm tile
+        step  = INTER_LUMI_MM   # 1250mm inter-luminaire spacing (2 tiles)
 
-        # ── 1. Collect shelves; reject extreme outliers ───────────────────
+        # ── 1. Collect and filter shelf objects ────────────────────────────
         raw_objs = [f for f in plan.furniture if f.inferred_type == 'shelving']
         if not raw_objs:
-            return self._place_grid_default(zone, excl, pitch, ox, oy)
+            return self._place_grid_default(zone, excl, INTER_LUMI_MM, ox, oy)
 
-        # Primary filter: building envelope clips out TEXT shelf labels from
-        # title-block legends drawn at the DWG origin.  The parser already does
-        # this (see dwg_parser.py post-processing), but apply it here too as a
-        # belt-and-suspenders for PDF input and other code paths.
-        _env = getattr(plan, 'building_envelope', None)
-        if _env is not None:
-            _env_buf = _env.buffer(2000)
+        envelope = getattr(plan, 'building_envelope', None)
+        if envelope is not None:
+            _env_buf = envelope.buffer(2000)
             _in_env  = [f for f in raw_objs if _env_buf.covers(Point(*f.position))]
             if _in_env:
                 raw_objs = _in_env
 
-        # Median + 8×MAD filter: removes INSERT positions millions of mm away
-        # (e.g. Bad Nenndorf outlier at +176M mm) while keeping all real shelves.
-        s_xs = sorted(f.position[0] for f in raw_objs)
-        s_ys = sorted(f.position[1] for f in raw_objs)
-        mid  = len(s_xs) // 2
-        med_x, med_y = s_xs[mid], s_ys[mid]
-        mad_x = max(sorted(abs(x - med_x) for x in s_xs)[mid], 500.0)
-        mad_y = max(sorted(abs(y - med_y) for y in s_ys)[mid], 500.0)
-        shelf_objs = ([f for f in raw_objs
-                       if abs(f.position[0] - med_x) <= 8 * mad_x
-                       and abs(f.position[1] - med_y) <= 8 * mad_y]
-                      or raw_objs)
-        shelf_pts = [f.position for f in shelf_objs]
+        shelf_objs = _mad_filter(raw_objs)
 
-        # ── 2. A lights — one per unique shelf-snapped grid node ──────────
+        # Restrict shelf objects to those inside (or within 300mm of) the sales floor
+        # zone polygon.  This prevents back-room or storage shelves from generating
+        # candidates that land outside the sales floor area.
+        _sf_buf = zone.polygon.buffer(300)
+        _sf_shelves = [f for f in shelf_objs if _sf_buf.covers(Point(*f.position))]
+        if _sf_shelves:
+            shelf_objs = _sf_shelves
+
+        # ── 2. Generate shelf-row candidates at 1250mm intervals ──────────
+        candidates = generate_shelf_row_candidates(
+            shelf_objects = shelf_objs,
+            zone_poly     = zone.polygon,
+            ox=ox, oy=oy,
+            pitch         = pitch,
+            spacing_mm    = step,
+            subpos        = 'A_center',
+            clearance_mm  = pitch * 1.5,  # 937mm — covers wall gondola edge candidates
+        )
+
+        if not candidates:
+            # Fallback: if shelf detection failed (PDF input or unusual DXF),
+            # use a uniform area grid at 1250mm spacing
+            candidates = generate_area_candidates(
+                zone_poly    = zone.polygon,
+                ox=ox, oy=oy,
+                pitch        = pitch,
+                spacing_mm   = step,
+                subpos       = 'A_center',
+                clearance_mm = 300.0,
+            )
+
+        # ── Shelf-body exclusion ──────────────────────────────────────────────
+        # Remove any candidate that falls inside a gondola body polygon.
+        # This is the final safety net: candidates should already be placed in
+        # aisles (midpoints between gondola rows), but any stray on-shelf
+        # candidate generated by legacy code paths is discarded here.
+        _shelf_excl_union = _build_shelf_exclusion(shelf_objs, pitch)
+        if _shelf_excl_union is not None:
+            _before = len(candidates)
+            candidates = [c for c in candidates
+                          if not _shelf_excl_union.contains(Point(c.x, c.y))]
+            _removed = _before - len(candidates)
+            if _removed > 0:
+                pass  # silently removed; these were on-shelf positions
+
+        # ── 3. Classify wall relation for each candidate ──────────────────
+        positions = [(c.x, c.y) for c in candidates]
+        wall_rels = classify_wall_relation(
+            positions         = positions,
+            building_envelope = envelope,
+            sales_area_poly   = zone.polygon,
+        )
+
+        # Column objects for feature extraction
+        col_objs = [f for f in plan.furniture if f.inferred_type == 'column']
+
+        # ── 4. Place A-lights and AW-lights via ML (with rule fallback) ───
         visited: set = set()
         placed:  list = []
+        use_ml = _load_placer_model() is not None
 
-        for sx, sy in shelf_pts:
-            gx, gy = _snap(sx, sy, pitch, ox, oy)
-            key = (round(gx), round(gy))
-            if key in visited or _is_excluded(gx, gy, excl):
+        for c, wall_rel in zip(candidates, wall_rels):
+            # Candidates pre-tagged as exterior_wall in ceiling_grid (wall gondola
+            # pass for outermost rows) override the distance-based result.
+            if getattr(c, 'wall_relation', 'interior') == 'exterior_wall':
+                wall_rel = 'exterior_wall'
+
+            # Assortment / depth signal — overrides geometric classification:
+            #   • depth >= 67mm or wall assortment → force exterior_wall
+            #   • known non-wall assortment + standard depth + far from wall →
+            #     correct false-positive exterior_wall (fixes Bad Nenndorf +15 B)
+            _sig = _shelf_wall_signal(c.x, c.y, shelf_objs, envelope)
+            if _sig == 'exterior_wall':
+                wall_rel = 'exterior_wall'
+            elif _sig == 'interior' and wall_rel == 'exterior_wall':
+                wall_rel = 'interior'
+
+            # ── Rule-based type (always computed as fallback / training label) ──
+            rule_type = 'AW' if wall_rel == 'exterior_wall' else 'A'
+
+            # ── ML-based type prediction ──────────────────────────────────────
+            if use_ml:
+                fv = _extract_features(c, zone, shelf_objs, col_objs)
+                ml_pred = _ml_predict_type(fv)
+                if wall_rel == 'exterior_wall':
+                    # Geometry says this candidate is at the building wall — only let
+                    # ML confirm AW; any other ML prediction demotes to rule_type=AW
+                    # to avoid ML overriding correct geometric classification.
+                    lumi_type = 'AW' if ml_pred == 'AW' else rule_type
+                else:
+                    lumi_type = ml_pred if ml_pred in ('A', 'AW') else rule_type
+            else:
+                fv = None
+                lumi_type = rule_type
+
+            # Collect training data: save feature vector with rule label
+            # (rule label is used as teacher signal until real corrections arrive)
+            if fv is not None:
+                _save_training_sample(fv, rule_type)
+
+            # AW sits at B_corner; A/C/E sit at A_center
+            subpos = 'B_corner' if lumi_type == 'AW' else 'A_center'
+            cx, cy = snap_to_subposition(c.x, c.y, ox, oy, pitch, subpos)
+            key = (round(cx), round(cy))
+            if key in visited:
+                continue
+            if _is_excluded(cx, cy, excl):
                 continue
             visited.add(key)
-            placed.append(_make(gx, gy, zone.zone_type, 'A', shelf_aligned=True))
+            placed.append(_make(cx, cy, zone.zone_type, lumi_type,
+                                shelf_aligned=True))
 
         if not placed:
             return []
 
-        a_keys = frozenset(visited)
+        a_keys = frozenset((round(p.x), round(p.y))
+                           for p in placed if p.lumi_type in ('A', 'AW'))
 
-        # ── 3. B lights — 4-connected neighbors of A lights ───────────────
-        # Each B candidate is exactly one grid step (1250 mm) from an A light.
-        # Aisles between shelf rows and the 1–2 m perimeter walkway are one step
-        # from the nearest shelf row → fully covered. Nodes further away
-        # (outside the building where there are no shelves) are never reached.
-        all_shelf_objs = [f for f in plan.furniture if f.inferred_type == 'shelving']
-        high_shelves   = [f for f in all_shelf_objs
-                          if _shelf_height_code(f) in ('57', '67')]
-        f57     = len(high_shelves) / max(len(all_shelf_objs), 1)
-        b_ratio = 0.269 + f57 * 0.239
-        max_b   = max(4, round(len(placed) * b_ratio))
-
-        # Build candidate list in row-major order (reproducible, spread-out fill)
-        b_cands: list = []
-        seen_b:  set  = set()
-        for ax, ay in sorted(a_keys, key=lambda k: (k[1], k[0])):
-            for dx, dy in [(pitch, 0), (-pitch, 0), (0, pitch), (0, -pitch)]:
-                nk = (round(ax + dx), round(ay + dy))
-                if nk not in visited and nk not in seen_b:
-                    seen_b.add(nk)
-                    b_cands.append(nk)
-
-        # Spread B lights evenly: take every step-th candidate, then fill remainder
-        step = max(1, len(b_cands) // max(max_b, 1))
-        b_count = 0
-        for i in range(0, len(b_cands), step):
-            if b_count >= max_b:
-                break
-            bx, by = b_cands[i]
-            if not _is_excluded(bx, by, excl):
-                visited.add((bx, by))
-                placed.append(_make(bx, by, zone.zone_type, 'B', shelf_aligned=False))
-                b_count += 1
-        # Fill any shortfall (step may cause under-placement)
-        if b_count < max_b:
-            for bx, by in b_cands:
-                if b_count >= max_b:
-                    break
-                if (bx, by) not in visited and not _is_excluded(bx, by, excl):
-                    visited.add((bx, by))
-                    placed.append(_make(bx, by, zone.zone_type, 'B', shelf_aligned=False))
-                    b_count += 1
-
-        # ── 4. E lights — column-adjacent nodes ──────────────────────────────
+        # ── 5. E-lights — column-adjacent nodes ──────────────────────────
         col_raw = [(f.position[0], f.position[1])
                    for f in plan.furniture if f.inferred_type == 'column']
 
-        # Deduplicate: same physical column often appears on multiple DXF layers
         col_dedup: list = []
         for cp in col_raw:
             if not any(math.sqrt((cp[0]-u[0])**2 + (cp[1]-u[1])**2) < 300.0
                        for u in col_dedup):
                 col_dedup.append(cp)
 
-        # Filter to columns inside (or within 200 mm of) the sales floor zone.
-        # Structural columns are always inside the building by definition, so this
-        # simply removes legend/title-block elements that appear far from the store.
         zone_near = zone.polygon.buffer(200)
         col_in_zone = [cp for cp in col_dedup
                        if zone_near.covers(Point(cp[0], cp[1]))]
 
         if col_in_zone:
             for col_x, col_y in col_in_zone:
-                # Search grid nodes centred on the snapped column position.
-                # Structural columns are inside the building → nearby grid nodes are too.
-                snap_cx = round(col_x / pitch) * pitch
-                snap_cy = round(col_y / pitch) * pitch
+                snap_cx = round((col_x - ox) / pitch) * pitch + ox
+                snap_cy = round((col_y - oy) / pitch) * pitch + oy
                 near = sorted(
                     [(snap_cx + di * pitch, snap_cy + dj * pitch)
                      for di in range(-2, 3) for dj in range(-2, 3)
@@ -647,28 +882,27 @@ class RealLuminairePlacer:
                 for gx, gy in near:
                     if placed_for_col >= 2:
                         break
-                    key = (round(gx), round(gy))
-                    if key not in visited and not _is_excluded(gx, gy, excl):
+                    # Use E_special sub-position within the tile
+                    cx, cy = snap_to_subposition(gx, gy, ox, oy, pitch, 'E_special')
+                    key = (round(cx), round(cy))
+                    if key not in visited and not _is_excluded(cx, cy, excl):
                         visited.add(key)
-                        placed.append(_make(gx, gy, zone.zone_type, 'E',
-                                           shelf_aligned=False))
+                        placed.append(_make(cx, cy, zone.zone_type, 'E',
+                                            shelf_aligned=False))
                         placed_for_col += 1
         else:
-            # No structural columns detected inside the zone.
-            # For large stores (many A lights = real full-size plan) use an area-based
-            # estimate: calibrated from Puderbach (660 m² → 36 E, ratio = 0.055/m²).
-            # For small/test plans (< 50 A lights) skip E entirely — they likely have no
-            # real structural columns, and zone.area_m2 may be a Hamburg fallback value.
+            # Area-based E-light estimate for stores with many shelves
             if len(placed) >= 50:
-                target_e = max(0, round(zone.area_m2 * 0.055))
+                target_e = max(0, round(zone.area_m2 * 0.038))
                 reachable: set = set(a_keys)
                 for ax, ay in a_keys:
-                    for dx, dy in [(pitch, 0), (-pitch, 0), (0, pitch), (0, -pitch)]:
+                    for dx, dy in [(step, 0), (-step, 0), (0, step), (0, -step)]:
                         reachable.add((round(ax + dx), round(ay + dy)))
                 e_cands = sorted(
                     [(gx, gy) for gx, gy in reachable
                      if (round(gx), round(gy)) not in visited
-                     and not _is_excluded(gx, gy, excl)],
+                     and not _is_excluded(gx, gy, excl)
+                     and zone.polygon.buffer(200).contains(Point(gx, gy))],
                     key=lambda p: (round((p[1] - oy) / pitch),
                                    round((p[0] - ox) / pitch)),
                 )
@@ -679,22 +913,24 @@ class RealLuminairePlacer:
                     if e_placed >= target_e:
                         break
                     gx, gy = e_cands[i]
-                    visited.add((round(gx), round(gy)))
-                    placed.append(_make(gx, gy, zone.zone_type, 'E', shelf_aligned=False))
+                    cx, cy = snap_to_subposition(gx, gy, ox, oy, pitch, 'E_special')
+                    visited.add((round(cx), round(cy)))
+                    placed.append(_make(cx, cy, zone.zone_type, 'E', shelf_aligned=False))
                     e_placed += 1
 
-        # ── 5. C lights — relabel 4 corner-nearest A lights ───────────────
+        # ── 7. C-lights — relabel 3 corner A-lights ──────────────────────
+        shelf_pts = [f.position for f in shelf_objs]
         if shelf_pts:
             sx_list = [p[0] for p in shelf_pts]
             sy_list = [p[1] for p in shelf_pts]
             corners = [
                 (min(sx_list), min(sy_list)), (max(sx_list), min(sy_list)),
-                (max(sx_list), max(sy_list)), (min(sx_list), max(sy_list)),
+                (max(sx_list), max(sy_list)),
             ]
             relabeled_c: set = set()
             for cx, cy in corners:
                 a_cands = [(i, p) for i, p in enumerate(placed)
-                           if p.lumi_type == 'A' and i not in relabeled_c]
+                           if p.lumi_type in ('A', 'AW') and i not in relabeled_c]
                 if not a_cands:
                     break
                 ni = min(a_cands,
@@ -704,19 +940,20 @@ class RealLuminairePlacer:
                 old = placed[ni]
                 placed[ni] = _make(old.x, old.y, old.zone_type, 'C', shelf_aligned=False)
 
-        # ── 6. W (Wabeneinsatz) — replace at cosmetics label positions ────
+        # ── 8. W — replace at cosmetics/perfume label positions ───────────
         cosmetics = [lbl for lbl in getattr(plan, 'zone_labels', [])
                      if any(k in lbl.get('text', '').lower()
                             for k in ('kosmetik', 'parfüm', 'duft', 'gobo',
                                       'beauty', 'mood'))]
         for cz in cosmetics[:6]:
-            cx, cy = cz['x_mm'], cz['y_mm']
-            gx, gy = _snap(cx, cy, pitch, ox, oy)
-            key = (round(gx), round(gy))
-            if key in visited:   # only replace an existing light, never add outside domain
+            cx, cy = snap_to_subposition(
+                cz['x_mm'], cz['y_mm'], ox, oy, pitch, 'A_center')
+            key = (round(cx), round(cy))
+            if key in visited:
                 placed = [p for p in placed
-                          if not (round(p.x) == round(gx) and round(p.y) == round(gy))]
-                placed.append(_make(gx, gy, zone.zone_type, 'W', shelf_aligned=False))
+                          if not (round(p.x) == round(cx) and
+                                  round(p.y) == round(cy))]
+                placed.append(_make(cx, cy, zone.zone_type, 'W', shelf_aligned=False))
 
         return placed
 
@@ -724,84 +961,87 @@ class RealLuminairePlacer:
 
     def _place_checkout(self, zone: ZoneResult, plan: ParsedPlan,
                         excl: list, pitch: float, ox: float, oy: float) -> list:
-        # Checkout uses TYPE_D (K2, 20W 40° 3200lm) — stronger focused beam
-        # for task lighting above checkout counters per EN 12464-1 §5.37 (500 lux)
-        poly = zone.polygon; placed = []; visited = set()
+        poly = zone.polygon
 
-        # Always place D at every detected checkout counter furniture position
+        # Clip synthetic checkout polygon to real building geometry.
+        # The checkout zone is built from furniture + 3000mm buffer and bleeds
+        # through exterior walls. Intersecting with the building convex hull
+        # (envelope + real room polygons) keeps D/E lights inside the walls.
+        from shapely.ops import unary_union as _uu_co
+        _envelope = getattr(plan, 'building_envelope', None)
+        _rp_co = [rp for rp in getattr(plan, 'room_polygons', [])
+                  if 2e6 <= rp.area <= 1000e6]
+        _hull_src = _rp_co[:]
+        if _envelope is not None:
+            _hull_src.append(_envelope)
+        if _hull_src:
+            _bldg = _uu_co(_hull_src).convex_hull.buffer(600)
+            _clipped = poly.intersection(_bldg)
+            if not _clipped.is_empty:
+                poly = _clipped
+
+        placed = []; visited = set()
+
+        # D-lights must snap to the D_special sub-position (312.5, 150) within
+        # each 625mm ceiling tile — NOT to the raw grid / tile origin.
         for f in plan.furniture:
             if f.inferred_type != 'checkout':
                 continue
             if not poly.contains(Point(f.position)):
                 continue
-            gx, gy = _snap(*f.position, pitch, ox, oy)
-            key = (round(gx), round(gy))
-            if key in visited or _is_excluded(gx, gy, excl):
+            gx, gy = _snap(*f.position, INTER_LUMI_MM, ox, oy)
+            cx, cy = snap_to_subposition(gx, gy, ox, oy, PITCH_MM, 'D_special')
+            key = (round(cx), round(cy))
+            if key in visited or _is_excluded(cx, cy, excl):
                 continue
             visited.add(key)
-            placed.append(_make(gx, gy, zone.zone_type, 'D', shelf_aligned=False))
+            placed.append(_make(cx, cy, zone.zone_type, 'D', shelf_aligned=False))
 
-        # Fill the checkout zone grid — every ceiling tile in the checkout strip
-        # gets a D light.  200 mm clearance (vs 400 mm on the sales floor) ensures
-        # counter-end tiles at the zone boundary are included.
-        # "Deckenraster anpassen" notes appear in BOTH grid-fill and non-grid-fill
-        # stores (Puderbach D=29 and Hamburg D=2 both carry that annotation), so
-        # that flag is not a reliable differentiator — always grid-fill here.
-        for x, y in _grid_pts(poly, pitch, ox, oy, clr=200):
-            key = (round(x), round(y))
-            if key not in visited and not _is_excluded(x, y, excl):
+        for x, y in _grid_pts(poly, INTER_LUMI_MM, ox, oy, clr=200):
+            cx, cy = snap_to_subposition(x, y, ox, oy, PITCH_MM, 'D_special')
+            key = (round(cx), round(cy))
+            if key not in visited and not _is_excluded(cx, cy, excl):
                 visited.add(key)
-                placed.append(_make(x, y, zone.zone_type, 'D', shelf_aligned=False))
+                placed.append(_make(cx, cy, zone.zone_type, 'D', shelf_aligned=False))
 
         return placed
 
     # ── Storage ───────────────────────────────────────────────────────────────
 
     def _place_storage(self, zone: ZoneResult, excl: list,
-                       pitch: float, ox: float, oy: float) -> list:
-        # Storage: uniform grid, Type B only (wider beam, cost-effective)
+                       ox: float, oy: float) -> list:
         return [_make(x, y, zone.zone_type, 'B', shelf_aligned=False)
-                for x, y in _grid_pts(zone.polygon, pitch, ox, oy, clr=300)
+                for x, y in _grid_pts(zone.polygon, INTER_LUMI_MM, ox, oy, clr=300)
                 if not _is_excluded(x, y, excl)]
 
-    # ── Window display (Schaufenster) — NEO85-SX K6 track spotlights ─────────
+    # ── Window display ────────────────────────────────────────────────────────
 
     def _place_display_window(self, zone: ZoneResult, excl: list,
-                              pitch: float, ox: float, oy: float) -> list:
-        """
-        Place NEO85-SX K6 track spotlights (TYPE_E) along the façade.
-
-        Rule from plan: "Idealer Abstand zwischen Schaufenster und
-        3-Phasen-Stromschiene = 25cm". Track runs parallel to the long wall,
-        250 mm inset from the glass. Spotlights spaced at pitch intervals.
-        """
+                              ox: float, oy: float) -> list:
         poly = zone.polygon; b = poly.bounds; pts = []
-        TRACK_OFFSET_MM = 250   # 25 cm from glass — per plan specification
+        TRACK_OFFSET_MM = 250
 
-        # Determine orientation: track runs along the longer axis of the zone
         width  = b[2] - b[0]
         height = b[3] - b[1]
 
         if width >= height:
-            # Track along X-axis, positioned near the shorter (Y) edge
             track_y = b[1] + TRACK_OFFSET_MM
             if not poly.contains(Point((b[0]+b[2])/2, track_y)):
                 track_y = b[3] - TRACK_OFFSET_MM
-            x = math.ceil((b[0] - ox) / pitch) * pitch + ox
+            x = math.ceil((b[0] - ox) / INTER_LUMI_MM) * INTER_LUMI_MM + ox
             while x <= b[2]:
                 if poly.contains(Point(x, track_y)) and not _is_excluded(x, track_y, excl):
                     pts.append((x, track_y))
-                x += pitch
+                x += INTER_LUMI_MM
         else:
-            # Track along Y-axis
             track_x = b[0] + TRACK_OFFSET_MM
             if not poly.contains(Point(track_x, (b[1]+b[3])/2)):
                 track_x = b[2] - TRACK_OFFSET_MM
-            y = math.ceil((b[1] - oy) / pitch) * pitch + oy
+            y = math.ceil((b[1] - oy) / INTER_LUMI_MM) * INTER_LUMI_MM + oy
             while y <= b[3]:
                 if poly.contains(Point(track_x, y)) and not _is_excluded(track_x, y, excl):
                     pts.append((track_x, y))
-                y += pitch
+                y += INTER_LUMI_MM
 
         return [_make(x, y, zone.zone_type, 'E', shelf_aligned=False) for x, y in pts]
 
@@ -809,34 +1049,28 @@ class RealLuminairePlacer:
 
     def _place_corridor(self, zone: ZoneResult, excl: list,
                         pitch: float, ox: float, oy: float) -> list:
-        """Single centreline row of lights along the long axis."""
         poly = zone.polygon; b = poly.bounds; pts = []
-        # Entrance lobby: TYPE_B (K4 60° wide beam — open transition space)
-        # Corridor:       TYPE_A (K1 40° standard)
         lumi_type = 'B' if zone.zone_type == 'entrance' else 'A'
-        if (b[2] - b[0]) >= (b[3] - b[1]):   # landscape: row along X
+        if (b[2] - b[0]) >= (b[3] - b[1]):
             cy = (b[1] + b[3]) / 2
-            x  = math.ceil((b[0] - ox) / pitch) * pitch + ox
+            x  = math.ceil((b[0] - ox) / INTER_LUMI_MM) * INTER_LUMI_MM + ox
             while x <= b[2]:
                 if poly.contains(Point(x, cy)) and not _is_excluded(x, cy, excl):
                     pts.append((x, cy))
-                x += pitch
-        else:                                  # portrait: row along Y
+                x += INTER_LUMI_MM
+        else:
             cx = (b[0] + b[2]) / 2
-            y  = math.ceil((b[1] - oy) / pitch) * pitch + oy
+            y  = math.ceil((b[1] - oy) / INTER_LUMI_MM) * INTER_LUMI_MM + oy
             while y <= b[3]:
                 if poly.contains(Point(cx, y)) and not _is_excluded(cx, y, excl):
                     pts.append((cx, y))
-                y += pitch
+                y += INTER_LUMI_MM
         return [_make(x, y, zone.zone_type, lumi_type) for x, y in pts]
 
     # ── Service / office ──────────────────────────────────────────────────────
 
     def _place_service(self, zone: ZoneResult, excl: list,
                        pitch: float, ox: float, oy: float) -> list:
-        # Service area + office: TYPE_B (K4, 20W 60° wide beam) — general overhead fill.
-        # Back-of-house areas do not receive task-lighting K2 (TYPE_D); that is reserved
-        # for checkout counters only.
         lumi_type = 'B'
         if zone.area_m2 < 5:
             b = zone.polygon.bounds
@@ -845,18 +1079,17 @@ class RealLuminairePlacer:
                 return []
             return [_make(cx, cy, zone.zone_type, lumi_type)]
         return [_make(x, y, zone.zone_type, lumi_type, shelf_aligned=False)
-                for x, y in _grid_pts(zone.polygon, pitch, ox, oy, clr=300)
+                for x, y in _grid_pts(zone.polygon, INTER_LUMI_MM, ox, oy, clr=300)
                 if not _is_excluded(x, y, excl)]
 
-    # ── Generic grid fallback (lux-calculated pitch already applied) ──────────
+    # ── Generic grid fallback ─────────────────────────────────────────────────
 
     def _place_grid_default(self, zone: ZoneResult, excl: list,
                             pitch: float, ox: float, oy: float) -> list:
         inner = zone.polygon.buffer(-PERIM_SHRINK_MM)
-        # Inner positions → K1 (TYPE_A), edge/perimeter → K3 (TYPE_C)
         return [_make(x, y, zone.zone_type,
                       'A' if (not inner.is_empty and inner.contains(Point(x, y))) else 'C')
-                for x, y in _grid_pts(zone.polygon, pitch, ox, oy)
+                for x, y in _grid_pts(zone.polygon, INTER_LUMI_MM, ox, oy)
                 if not _is_excluded(x, y, excl)]
 
 

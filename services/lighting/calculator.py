@@ -61,6 +61,7 @@ NO_LIGHTING_ZONE_TYPES: frozenset = frozenset({
     'technical',     # utility/technical rooms — different fixture type
     'service_area',  # back-of-house counters — non-MIKA80 fixtures, separate scope
     'office',        # back-of-house office — non-MIKA80 fixtures, separate scope
+    'storage',       # Lager — Oskar-E 625 panels (K2 scope), not MIKA80-E track system
 })
 
 # ── Rossmann standard constants ───────────────────────────────────────────────
@@ -68,7 +69,7 @@ NO_LIGHTING_ZONE_TYPES: frozenset = frozenset({
 MAINTENANCE_FACTOR:  float = 0.80   # quarterly cleaning, LED source (CIE 97)
 WORK_PLANE_MM:       int   = 850    # EN 12464-1 standard work plane
 DEFAULT_CEILING_MM:  int   = 3000   # Rossmann UK Rasterdecke standard
-BASE_GRID_PITCH_MM:  int   = 1250   # Startmaß Rasterdecke (confirmed on all plans)
+BASE_GRID_PITCH_MM:  int   = 625    # 625mm tile module — Rossmann Rasterdecke
 
 # ── Complete luminaire catalog ────────────────────────────────────────────────
 #
@@ -291,18 +292,18 @@ def optimal_spacing_mm(area_m2: float, n_required: int) -> float:
 
 def snap_to_ceiling_grid(spacing_mm: float, base: int = BASE_GRID_PITCH_MM) -> int:
     """
-    Snap a calculated spacing to the nearest multiple of the Rossmann
-    ceiling grid module (1250 mm).  Half-module (625 mm) is also valid.
+    Snap a calculated spacing to the nearest multiple of the 625mm tile module.
+    Luminaires sit every 2 tiles (1250mm) by default; densest allowed is 1 tile (625mm).
     Candidates: 625, 1250, 1875, 2500, 3125, 3750, 5000
     """
     candidates = [
-        base // 2,           # 625
-        base,                # 1250
-        base * 3 // 2,       # 1875
-        base * 2,            # 2500
-        base * 5 // 2,       # 3125
-        base * 3,            # 3750
-        base * 4,            # 5000
+        base,                # 625
+        base * 2,            # 1250  ← typical inter-luminaire spacing
+        base * 3,            # 1875
+        base * 4,            # 2500
+        base * 5,            # 3125
+        base * 6,            # 3750
+        base * 8,            # 5000
     ]
     return min(candidates, key=lambda p: abs(p - spacing_mm))
 

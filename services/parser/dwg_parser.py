@@ -48,6 +48,9 @@ class FurnitureInsert:
     rotation: float                 # degrees
     layer: str
     inferred_type: str = "unknown"  # set by block_name_to_type()
+    depth_code: str    = ""         # e.g. "47", "57" — from 21_Modulnummer ATTRIB
+    assortment: str    = ""         # e.g. "PARFÜM" — from 20_Sortimentierung ATTRIB
+    shelf_category: str = ""        # shelf type code — from 11 Regaltyp-Kennzeichnung ATTRIB
 
 
 @dataclass
@@ -71,7 +74,7 @@ class ParsedPlan:
     bounds: Optional[tuple]                 = None  # (minx, miny, maxx, maxy)
     # Detected ceiling grid start offset (mm)
     grid_origin_mm: tuple                   = field(default_factory=lambda: (0.0, 0.0))
-    grid_pitch_mm: float                    = 1250.0
+    grid_pitch_mm: float                    = 625.0
     # Polygons where luminaire placement is forbidden
     exclusion_zones: list                   = field(default_factory=list)
     # Zone labels extracted from text (same format as pdf_parser)
@@ -203,7 +206,7 @@ def lines_to_polygons(lines: list) -> list[Polygon]:
 
 def _detect_grid_origin_from_lines(
         grid_lines: list[CeilingGridLine],
-        pitch_hint: float = 1250.0) -> tuple[tuple, float]:
+        pitch_hint: float = 625.0) -> tuple[tuple, float]:
     """
     Compute the ceiling grid start offset and pitch from grid line positions.
 
@@ -356,6 +359,24 @@ class DWGParser:
                     layer=entity.dxf.layer,
                     inferred_type=ftype,
                 )
+                # Extract shelf attributes from ATTRIB child entities
+                try:
+                    for attrib in entity.attribs:
+                        al = getattr(attrib.dxf, 'layer', '')
+                        at = (getattr(attrib.dxf, 'text', '') or '').strip()
+                        if not at:
+                            continue
+                        if al == '20_Sortimentierung' and not fi.assortment:
+                            fi.assortment = at
+                        elif al == '11 Regaltyp-Kennzeichnung' and not fi.shelf_category:
+                            fi.shelf_category = at
+                        elif al == '21_Modulnummer' and not fi.depth_code:
+                            # Depth code is a numeric value like "47", "57/47"
+                            import re as _re_att
+                            if _re_att.match(r'^\d', at):
+                                fi.depth_code = at
+                except (AttributeError, TypeError):
+                    pass
                 plan.furniture.append(fi)
                 # Block names matching escalators/lifts → mark as exclusion
                 if any(k in bname.lower() for k in _EXCLUSION_BLOCKS):
@@ -383,18 +404,29 @@ class DWGParser:
                                           "layer": entity.dxf.layer})
                 # Infer zone label from German text
                 from services.parser.pdf_parser import (
-                    _zone_from_label, _is_exclusion_label, SHELF_LABELS)
+                    _zone_from_label, _is_exclusion_label)
                 text_stripped = text.strip()
                 text_lower    = text_stripped.lower()
 
                 # Gap 6 — Startmaß / Referenzmaß Rasterdecke:
-                # The annotation that anchors the 1250mm ceiling grid to the
-                # building.  Its position IS the grid origin.  Only set when
-                # the DWG has no grid lines (grid_origin_mm still at default).
+                # The Rossmann standard grid phase offset is 1000mm (X) and
+                # 2000mm (Y) from the building corner — confirmed in DRP and
+                # LISP plugin.  The annotation's own drawing position is NOT
+                # the grid origin; only the encoded values matter.
+                # Extract numeric values from text like "Startmaß 1.00m / 2.00m"
+                # and apply them as an absolute phase offset.  If no values are
+                # found, fall back to the Rossmann default (1000, 2000).
                 if (('startmaß' in text_lower or 'referenzmaß' in text_lower)
                         and 'rasterdecke' in text_lower
                         and plan.grid_origin_mm == (0.0, 0.0)):
-                    plan.grid_origin_mm = (round(pos[0]), round(pos[1]))
+                    import re as _re2
+                    _nums = _re2.findall(r'[\d]+[,.][\d]+', text_stripped)
+                    if len(_nums) >= 2:
+                        _ox = round(float(_nums[0].replace(',', '.')) * 1000)
+                        _oy = round(float(_nums[1].replace(',', '.')) * 1000)
+                    else:
+                        _ox, _oy = 1000, 2000  # Rossmann default Startmaß
+                    plan.grid_origin_mm = (_ox, _oy)
 
                 # Gap 3 — Deckenraster anpassen:
                 # Signals that the ceiling grid in the checkout area must be
@@ -402,11 +434,7 @@ class DWGParser:
                 # grid-fill and use only the detected furniture positions.
                 if 'deckenraster anpassen' in text_lower:
                     plan.checkout_grid_adjusted = True
-                if text_stripped in SHELF_LABELS:
-                    plan.furniture.append(FurnitureInsert(
-                        f"SHELF_{text_stripped}", pos, 0.0,
-                        entity.dxf.layer, "shelving"))
-                elif _is_exclusion_label(text_stripped):
+                if _is_exclusion_label(text_stripped):
                     exclusion_polys.append(
                         shapely_box(pos[0]-1500, pos[1]-1500,
                                     pos[0]+1500, pos[1]+1500))
@@ -451,7 +479,8 @@ class DWGParser:
             ]
 
         # ── Ceiling grid origin & pitch ────────────────────────────────────
-        if plan.grid_lines:
+        # Only auto-detect if no annotation (Startmaß/Referenzmaß) already set it.
+        if plan.grid_lines and plan.grid_origin_mm == (0.0, 0.0):
             plan.grid_origin_mm, plan.grid_pitch_mm = \
                 _detect_grid_origin_from_lines(plan.grid_lines)
 

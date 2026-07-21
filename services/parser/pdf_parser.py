@@ -72,8 +72,13 @@ def _get_pdf_text(doc, mode: str):
 
 @dataclass
 class FurnitureInsert:
-    block_name: str; position: tuple; rotation: float
-    layer: str;      inferred_type: str = "unknown"
+    block_name:    str
+    position:      tuple
+    rotation:      float
+    layer:         str
+    inferred_type: str = "unknown"
+    depth_code:    str = ""   # primary depth in mm, e.g. "57", "47", "77"
+    assortment:    str = ""   # product category label, e.g. "HAARPFLEGE", "WPR"
 
 
 @dataclass
@@ -95,7 +100,7 @@ class ParsedPlan:
     layer_map:         dict  = field(default_factory=dict)
     bounds:            Optional[tuple] = None
     scale:             str   = "1:50"
-    grid_pitch_mm:     float = 1250.0
+    grid_pitch_mm:     float = 625.0
     zone_labels:       list  = field(default_factory=list)
     shelf_runs:        list  = field(default_factory=list)
     # Grid start offset (mm) detected from the drawing or calibration
@@ -158,7 +163,7 @@ LABEL_MAP = {
     'schacht':'elevator',          # shaft
 }
 SHELF_LABELS  = {'57','47','77','37','67','27','57/47','47/37','77/57','57/37'}
-CHECKOUT_KWDS = {'kasse','kassenstuhl','lübecker','abweiser'}
+CHECKOUT_KWDS = {'kasse','kassenstuhl','lübecker'}
 
 # Keywords whose labelled areas should be treated as exclusion zones
 EXCLUSION_KWDS = {
@@ -197,18 +202,76 @@ class PDFFloorPlanParser:
         def p2mm(px, py): return _pt2mm(px, scale), _pt2mm(ph-py, scale)
 
         plan = ParsedPlan(source_file=str(filepath), scale=f"1:{scale}",
-                          grid_pitch_mm=1250.0, layer_map=DEFAULT_LAYER_MAP)
+                          grid_pitch_mm=625.0, layer_map=DEFAULT_LAYER_MAP)
 
         if '+3,00' in all_text: plan.ceiling_height_mm = 3000.0
         if '+3,30' in all_text: plan.fries_height_mm   = 3300.0
         if '+2,74' in all_text: plan.ceiling_height_mm = 2740.0
 
+        # ── Pre-pass: build assortment spatial index from text blocks ─────────
+        # Shelf annotation blocks contain a depth code line (e.g. "57/47") and
+        # an ALL-CAPS assortment name (e.g. "HAARPFLEGE", "WPR").  We extract the
+        # assortment label from each such block so it can be assigned to the
+        # nearest shelf word when the shelf items are created below.
+        _SHELF_KNOWN = SHELF_LABELS | {'67/57', '77/47', '47/27'}
+        _MOD_RE      = re.compile(r'^\d+\s*[-–]\s*\d+\s*[-–]\s*\d+')
+        # Non-assortment ALL-CAPS words that appear in plans and must be skipped.
+        _ASSORT_SKIP = frozenset({
+            'SCHUBLADE', 'ABSCHLIESSBAR', 'ABSCHLIESBAR', 'ABWEISER',
+            'FLUCHTWEG', 'PLAN', 'MSR', 'ZBV', 'EG', 'OG', 'WC', 'PROMO',
+            'STÄNDER', 'SCHIRM', 'THEKEN', 'KÖRBE', 'SPIEGEL', 'ISANA',
+            'BEELINE', 'ROLL', 'AUF WIEDERSEHEN', 'KINDER', 'SCHRANK',
+            'KÜHL', 'CENTAUER', 'HINTERLEUCHTET', 'GRUSSKARTEN', 'MODERN TIMES',
+        })
+
+        def _is_assortment(s: str) -> bool:
+            s = s.strip()
+            if len(s) < 3 or s in _SHELF_KNOWN:
+                return False
+            if _MOD_RE.match(s):
+                return False
+            if s.upper() in _ASSORT_SKIP:
+                return False
+            # Skip lines ending with a hyphen (word-wrapped non-assortment labels)
+            if s.endswith('-'):
+                return False
+            alpha = [c for c in s if c.isalpha()]
+            return (len(alpha) >= 3 and
+                    sum(1 for c in alpha if c.isupper()) / len(alpha) >= 0.8)
+
+        # Build assortment spatial index from ALL text blocks (not just shelf blocks).
+        # Hamburg PDF puts assortment labels in a separate block adjacent to the depth
+        # code block; other stores embed both in one block.  Scanning all blocks and
+        # spatial-matching to shelf positions handles both layouts.
+        _assort_index: list = []   # list of (assortment_name, x_mm, y_mm)
+        for _blk in page.get_text("blocks"):
+            _lines = [ln.strip() for ln in _blk[4].strip().split('\n') if ln.strip()]
+            if not _lines:
+                continue
+            _bcx, _bcy = p2mm((_blk[0]+_blk[2])/2, (_blk[1]+_blk[3])/2)
+            for _ln in _lines:
+                if _ln in _SHELF_KNOWN:
+                    continue
+                if _is_assortment(_ln):
+                    _assort_index.append((_ln, _bcx, _bcy))
+                    break   # one assortment label per block
+
+        # ── Words loop ────────────────────────────────────────────────────────
         for w in page.get_text("words"):
             wt = w[4].strip()
             wx, wy = p2mm((w[0]+w[2])/2, (w[1]+w[3])/2)
             if wt in SHELF_LABELS:
+                # Nearest assortment label within 3000mm
+                best_assort, best_d = '', 3000.0
+                for _an, _ax, _ay in _assort_index:
+                    _d = math.sqrt((wx - _ax) ** 2 + (wy - _ay) ** 2)
+                    if _d < best_d:
+                        best_d, best_assort = _d, _an
+                _dm = re.match(r'^(\d+)', wt)
+                depth_str = _dm.group(1) if _dm else ''
                 plan.furniture.append(FurnitureInsert(
-                    f"SHELF_{wt}", (wx,wy), 0.0, "SHELVING", "shelving"))
+                    f"SHELF_{wt}", (wx,wy), 0.0, "SHELVING", "shelving",
+                    depth_code=depth_str, assortment=best_assort))
             elif any(kw in wt.lower() for kw in CHECKOUT_KWDS):
                 plan.furniture.append(FurnitureInsert(
                     "CHECKOUT", (wx,wy), 0.0, "CHECKOUT", "checkout"))
@@ -261,7 +324,7 @@ class PDFFloorPlanParser:
         """
         import re
         # Try to find a numeric offset mentioned near "Startmaß Rasterdecke"
-        m = re.search(r'startma[ßs][^\d]*([\d,\.]+)\s*[mx]?\s*([\d,\.]+)?',
+        m = re.search(r'(?:startma[ßs]|referenzma[ßs])[^\d]*([\d,\.]+)\s*[mx]?\s*([\d,\.]+)?',
                       full_text.lower())
         if m:
             try:
@@ -356,14 +419,20 @@ class PDFFloorPlanParser:
         cols = []
         seen = set()
         for path in paths:
+            # Structural columns must be filled — shelf outlines are stroke-only.
+            fill = path.get('fill')
+            if fill is None:
+                continue
+            if all(abs(c - 1.0) < 0.02 for c in fill[:3]):   # skip white-filled
+                continue
             r   = path['rect']
             wmm = r.width  * (25.4 / 72) * scale
             hmm = r.height * (25.4 / 72) * scale
             area = wmm * hmm
-            if not (22_500 < area < 500_000):   # 150×150mm → 700×700mm
+            if not (50_000 < area < 450_000):   # ~225×225mm → ~670×670mm
                 continue
             aspect = wmm / max(hmm, 1)
-            if not (0.25 < aspect < 4.0):       # roughly square / circular
+            if not (0.35 < aspect < 2.8):       # roughly square
                 continue
             cx, cy = p2mm((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
             key = (round(cx / 100), round(cy / 100))   # cluster within 100mm
