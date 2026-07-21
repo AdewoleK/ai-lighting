@@ -1,19 +1,75 @@
 """
 lighting-ai/services/classifier/room_classifier_real.py
 Zone classification for real Rossmann plans.
-Primary: zone labels from PDF text.  Fallback: area+furniture rules.
+Primary: zone labels from PDF text.
+Secondary: ML model (room_classifier.pkl).
+Fallback: area+furniture rules.
 """
 from __future__ import annotations
-import math, re
+import math, pickle, re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 import sys
 
+import numpy as np
 from shapely.geometry import Polygon, Point, MultiPoint, box as shapely_box
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from services.parser.pdf_parser import ParsedPlan
+from config import MODELS_DIR
+
+# ── Zone ML model (loaded once at import) ─────────────────────────────────────
+_ZONE_MODEL = None
+_ZONE_MODEL_PATH = MODELS_DIR / "room_classifier.pkl"
+
+def _load_zone_model():
+    global _ZONE_MODEL
+    if _ZONE_MODEL is None and _ZONE_MODEL_PATH.exists():
+        try:
+            with open(_ZONE_MODEL_PATH, 'rb') as f:
+                _ZONE_MODEL = pickle.load(f)
+        except Exception:
+            _ZONE_MODEL = None
+    return _ZONE_MODEL
+
+_ZONE_FEAT_KEYS = [
+    "area_m2","width_m","height_m","aspect_ratio","perimeter_m",
+    "ceiling_h_m","n_checkout","n_shelving","n_desk","n_storage",
+    "n_door","n_window","total_furniture","shelving_density",
+]
+
+def _ml_classify(area_m2, n_shelf, n_check, width_m, height_m,
+                  perimeter_m, ceiling_h_m) -> tuple[str, float]:
+    """Run the RF zone classifier. Returns (zone_type, confidence)."""
+    clf = _load_zone_model()
+    if clf is None:
+        return 'unknown', 0.0
+    asp = max(width_m, height_m) / max(min(width_m, height_m), 0.1)
+    feat = {
+        "area_m2":          area_m2,
+        "width_m":          width_m,
+        "height_m":         height_m,
+        "aspect_ratio":     asp,
+        "perimeter_m":      perimeter_m,
+        "ceiling_h_m":      ceiling_h_m,
+        "n_checkout":       n_check,
+        "n_shelving":       n_shelf,
+        "n_desk":           0,
+        "n_storage":        0,
+        "n_door":           0,
+        "n_window":         0,
+        "total_furniture":  n_shelf + n_check,
+        "shelving_density": n_shelf / max(area_m2, 1),
+    }
+    vec = np.array([[feat.get(k, 0.0) for k in _ZONE_FEAT_KEYS]], dtype=np.float32)
+    try:
+        pred  = clf.predict(vec)[0]
+        proba = clf.predict_proba(vec)[0]
+        conf  = float(proba.max())
+        return pred, conf
+    except Exception:
+        return 'unknown', 0.0
 
 
 @dataclass
@@ -146,7 +202,11 @@ def _label_zones(plan: ParsedPlan) -> list:
 
     # Use building_envelope (pre-computed in parser) if available — it is the most
     # reliable boundary.  Fall back to the best-coverage room polygon, then convex hull.
-    room_polys = getattr(plan, 'room_polygons', None) or []
+    # Filter out drawing frames (> 1000 m²) and tiny furniture footprints (< 5 m²) so
+    # that _find_room_poly_for_label doesn't return the frame polygon, which covers
+    # everything and causes every room label to fall back to a synthetic square.
+    _all_rp  = getattr(plan, 'room_polygons', None) or []
+    room_polys = [r for r in _all_rp if 5e6 <= r.area <= 1000e6]
     envelope   = getattr(plan, 'building_envelope', None)
 
     # building_envelope = WHOLE BUILDING (sales + storage + WC + offices).
@@ -258,13 +318,28 @@ def _label_zones(plan: ParsedPlan) -> list:
     # polygon (entrance vestibule), and clipping would erase the zone entirely.
     if not any(z.zone_type == 'checkout_zone' for z in zones):
         co_furn = [f.position for f in plan.furniture if f.inferred_type == 'checkout']
-        # Outlier rejection for furniture positions
+        # Filter to positions inside or near the building footprint.
+        # Checkout labels in drawing title blocks (outside the plan area) create
+        # spurious items far outside the actual building footprint.
+        _env = getattr(plan, 'building_envelope', None)
+        if _env is None:
+            # For PDF input (no explicit envelope), use the sales_floor convex hull
+            # of all shelf positions as the footprint proxy.
+            _sf_pts = [f.position for f in plan.furniture if f.inferred_type == 'shelving']
+            if _sf_pts:
+                _env = MultiPoint(_sf_pts).convex_hull
+        if _env is not None and co_furn:
+            _env_buf = _env.buffer(3000)
+            co_furn = [p for p in co_furn if _env_buf.covers(Point(*p))]
+        # Outlier rejection for furniture positions.
+        # Checkout counters occupy one compact strip at most ~8m wide.
+        # Hard-cap the radius so scattered 'kasse' annotations don't inflate the zone.
         if len(co_furn) >= 3:
             xs = sorted(p[0] for p in co_furn)
             ys = sorted(p[1] for p in co_furn)
             med_x = xs[len(xs) // 2]; med_y = ys[len(ys) // 2]
             dists = [math.sqrt((p[0]-med_x)**2 + (p[1]-med_y)**2) for p in co_furn]
-            threshold = max(sorted(dists)[len(dists)//2] * 5, 5000)
+            threshold = min(max(sorted(dists)[len(dists)//2] * 3, 4000), 7000)
             co_furn = [p for p, d in zip(co_furn, dists) if d <= threshold]
         # Merge with label-position anchors
         co_pts = list(co_furn) + checkout_lbl_pts
@@ -276,6 +351,13 @@ def _label_zones(plan: ParsedPlan) -> list:
             hull = MultiPoint(co_pts).convex_hull if len(co_pts) >= 3 else \
                    Point(co_pts[0]).buffer(buf_mm)
             co_hull = hull.buffer(buf_mm)
+            # Safety cap: checkout zones > 120 m² are detection artefacts
+            # (scattered checkout labels far outside the actual counter row).
+            # Fall back to a ~45 m² circle (r=3800 mm) around the centroid;
+            # at 1250 mm pitch this yields ~29 D lights for a typical strip.
+            if co_hull.area > 120e6:
+                cen = MultiPoint(co_pts).centroid
+                co_hull = cen.buffer(3800)
             co_area = max(co_hull.area / 1e6, len(co_pts) * 8.0)
             zones.append(ZoneResult(
                 polygon_index=idx, polygon=co_hull, zone_type='checkout_zone',
@@ -313,10 +395,20 @@ class RealRoomClassifier:
                 a=poly.area/1e6; b=poly.bounds
                 w=(b[2]-b[0])/1000; h=(b[3]-b[1])/1000
                 asp=max(w,h)/max(min(w,h),0.1)
-                zt,conf=_rule_classify(a,ns,nc,asp)
+                perim=poly.length/1000
+                ceil_h=plan.ceiling_height_mm/1000
+
+                # Try ML model first; fall back to rules if confidence is low
+                zt_ml, conf_ml = _ml_classify(a, ns, nc, w, h, perim, ceil_h)
+                if zt_ml != 'unknown' and conf_ml >= 0.65:
+                    zt, conf, method = zt_ml, conf_ml, 'ml'
+                else:
+                    zt, conf = _rule_classify(a, ns, nc, asp)
+                    method = 'rule'
+
                 zones.append(ZoneResult(
                     polygon_index=idx, polygon=poly, zone_type=zt,
-                    confidence=conf, method='rule', area_m2=a,
+                    confidence=conf, method=method, area_m2=a,
                     ceiling_height_mm=plan.ceiling_height_mm,
                     furniture_counts={'shelving':ns,'checkout':nc}))
             return ClassifiedPlan(source_file=plan.source_file,zones=zones)
