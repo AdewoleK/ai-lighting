@@ -93,6 +93,7 @@ COLOR_NAME_ACI = {    # human-readable color name → ACI value
     "White":      7,
     "Orange":     30,
     "OrangeGold": 22,   # ACI 22 — used for AW (exterior-wall shelf)
+    "Gold":       41,   # ACI 41 — warm gold, used for P (Plakate)
 }
 
 

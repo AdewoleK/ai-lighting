@@ -70,14 +70,15 @@ COLOR_HEX = {
     'Blue':    '#4488ff',
     'Magenta': '#dd44ff',
     'Orange':  '#ff8822',
+    'Gold':    '#cc9900',
 }
 COLORS = list(COLOR_HEX.keys())
 
-SHAPE_DEFAULTS = ['Circle', 'Star',   'Diamond', 'Triangle', 'Cross', 'Square']
-COLOR_DEFAULTS = ['Magenta', 'Orange', 'Cyan',   'Yellow',   'Blue',  'Red']
+SHAPE_DEFAULTS = ['Circle', 'Star',   'Diamond', 'Triangle', 'Cross', 'Square', 'Hexagon', 'Pentagon']
+COLOR_DEFAULTS = ['Magenta', 'Orange', 'Cyan',   'Yellow',   'Blue',  'Red',    'Green',   'Gold']
 
-# Canonical Rossmann luminaire types in tab order
-_ROSSMANN_TYPES = ['A', 'AW', 'C', 'D', 'E', 'B']
+# Canonical Rossmann luminaire types in tab order (all 8)
+_ROSSMANN_TYPES = ['A', 'AW', 'C', 'D', 'E', 'B', 'W', 'P']
 
 
 def draw_shape(canvas, shape_name: str, hex_color: str, size: int = 32) -> None:
@@ -1007,10 +1008,12 @@ def open_config_dialog():
             'color':       _existing.get(_ROSSMANN_TYPES[i], {}).get('color',       COLOR_DEFAULTS[i]),
             'description': _existing.get(_ROSSMANN_TYPES[i], {}).get('description', ''),
         }
-        for i in range(6)
+        for i in range(8)
     ]
     active_idx  = tk.IntVar(value=0)
-    num_types   = tk.IntVar(value=5)
+    # Initialise tab count from the saved config; fall back to 8 (all canonical types)
+    _n_saved = sum(1 for t in _ROSSMANN_TYPES if t in _existing)
+    num_types   = tk.IntVar(value=_n_saved if _n_saved >= 5 else 8)
 
     # ── Header ──────────────────────────────────────────────────────────────
     hdr = tk.Frame(dlg, bg='#181c24')
@@ -1220,7 +1223,7 @@ def open_config_dialog():
 
     def change_n(delta):
         v = num_types.get() + delta
-        if 1 <= v <= 6:
+        if 1 <= v <= 8:
             num_types.set(v)
             rebuild_tabs()
 
@@ -1260,7 +1263,7 @@ def open_config_dialog():
         cur = active_idx.get()
         select_type(cur if cur < n else n - 1)
 
-    for i in range(6):
+    for i in range(8):
         b = tk.Button(tabs_frame,
                       text=_ROSSMANN_TYPES[i],
                       font=('Helvetica', 12, 'bold'),
@@ -1345,10 +1348,12 @@ def open_config_dialog():
     # ── Description Manager ───────────────────────────────────────────────
     _CANONICAL_DESCS = [
         "MIKA80-E K1 Regalbeleuchtung 15W 40° 2400lm 3000K",
-        "MIKA80-E K4 Ergänzungsbeleuchtung 20W 60° 3200lm 3000K",
         "MIKA80-E K3 Regalbeleuchtung Rand 15W 40° 2400lm 3000K",
+        "MIKA80-E K4 Ergänzungsbeleuchtung 20W 60° 3200lm 3000K",
         "MIKA80-E K2 Checkout/Service 20W 40° 3200lm 3000K",
         "NEO85-SX K6 Schaufenster-Strahler 20W 60° 3200lm Track",
+        "MIKA80-E Wabeneinsatz 20W 36° 1700lm Anti-Glare 3000K",
+        "MIKA80-E K5 Plakate 16W 24° 2100lm Power-Linse 3000K",
     ]
     _DESC_PLACEHOLDER = "Type your light description here..."
 
@@ -1882,6 +1887,9 @@ def _default_types() -> list:
         {"type": "C",  "shape": "Diamond",  "color": "Cyan",    "description": "Corner zone"},
         {"type": "D",  "shape": "Triangle", "color": "Yellow",  "description": "Checkout / service"},
         {"type": "E",  "shape": "Cross",    "color": "Blue",    "description": "Track spotlight"},
+        {"type": "B",  "shape": "Square",   "color": "Red",     "description": "Wide-beam supplement"},
+        {"type": "W",  "shape": "Hexagon",  "color": "Green",   "description": "Wabeneinsatz anti-glare"},
+        {"type": "P",  "shape": "Pentagon", "color": "Gold",    "description": "Plakate spotbeam"},
     ]
 
 
