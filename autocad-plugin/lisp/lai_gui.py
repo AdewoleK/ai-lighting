@@ -125,6 +125,191 @@ def draw_shape(canvas, shape_name: str, hex_color: str, size: int = 32) -> None:
         canvas.create_rectangle(cx-t, p,    cx+t, s-p,  **kw)
 
 
+# ── Feedback / correction dialog ─────────────────────────────────────────────
+
+def open_feedback_dialog(job_id: str = ""):
+    """
+    Let the user flag placement errors on a completed job.
+    Corrections are sent to POST /corrections and a background retrain is triggered.
+    """
+    jid = job_id or (_last_job_id[0] or "")
+    if not jid:
+        from tkinter import messagebox
+        messagebox.showwarning(
+            "No Job",
+            "Run an analysis first — then you can give feedback on the placement.",
+            parent=root,
+        )
+        return
+
+    dlg = tk.Toplevel(root)
+    dlg.title("Placement Correction Feedback")
+    dlg.configure(bg='#111419')
+    dlg.resizable(False, False)
+    dlg.attributes('-topmost', True)
+    dlg.grab_set()
+
+    W, H = 500, 560
+    sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+    dlg.geometry(f"{W}x{H}+{max(0,(sw-W)//2)}+{max(0,(sh-H)//4)}")
+
+    DBG   = '#111419'
+    DBRI  = '#e0e6f0'
+    DMUT  = '#5c6680'
+    DBORD = '#252c3a'
+    DACC  = '#ff9800'
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    hdr = tk.Frame(dlg, bg='#1a1405')
+    hdr.pack(fill='x')
+    tk.Label(hdr, text="Placement Correction",
+             font=('Helvetica', 13, 'bold'),
+             bg='#1a1405', fg=DACC, padx=16, pady=10, anchor='w').pack(side='left')
+    tk.Label(hdr, text="trains the AI",
+             font=('Helvetica', 10), bg='#1a1405', fg=DMUT, pady=10).pack(side='left')
+    tk.Frame(dlg, bg=DBORD, height=1).pack(fill='x')
+
+    tk.Label(dlg,
+             text=f"Job: {jid}\n"
+                  "Your feedback goes directly into the training dataset.\n"
+                  "The model retrains itself in the background after you submit.",
+             font=('Helvetica', 9), bg=DBG, fg=DMUT,
+             justify='left', anchor='w').pack(fill='x', padx=16, pady=(10, 4))
+
+    # ── Issue chips ───────────────────────────────────────────────────────────
+    tk.Frame(dlg, bg=DBORD, height=1).pack(fill='x', padx=16, pady=(4, 6))
+    tk.Label(dlg, text="What went wrong?  (select all that apply)",
+             font=('Helvetica', 9, 'bold'), bg=DBG, fg=DBRI).pack(
+                 anchor='w', padx=16, pady=(0, 4))
+
+    ISSUES = [
+        ("Lights on shelves",    "on_shelf"),
+        ("Outside floor plan",   "out_of_bounds"),
+        ("Wrong light type",     "wrong_type"),
+        ("Too many lights",      "too_many"),
+        ("Too few lights",       "too_few"),
+        ("Zone not detected",    "zone_missed"),
+        ("Aisle not found",      "aisle_missed"),
+        ("Placement looks good", "looks_good"),
+    ]
+
+    tag_vars: dict = {}
+    tag_btns: dict = {}
+
+    chips_frame = tk.Frame(dlg, bg=DBG)
+    chips_frame.pack(fill='x', padx=16, pady=(0, 10))
+
+    def _toggle(key):
+        v = tag_vars[key]
+        v.set(not v.get())
+        is_sel = v.get()
+        good   = (key == "looks_good")
+        bg_col = ('#1a3a1a' if good else '#3a1800') if is_sel else '#1e2330'
+        fg_col = ('#4caf50' if good else '#ff9800') if is_sel else '#8892a4'
+        tag_btns[key].configure(bg=bg_col, fg=fg_col)
+
+    for i, (label, key) in enumerate(ISSUES):
+        v = tk.BooleanVar(value=False)
+        tag_vars[key] = v
+        b = tk.Button(chips_frame, text=label,
+                      font=('Helvetica', 9),
+                      bg='#1e2330', fg='#8892a4',
+                      activebackground='#3a1800', activeforeground='#ff9800',
+                      relief='flat', padx=8, pady=5, cursor='hand2',
+                      command=lambda k=key: _toggle(k))
+        b.grid(row=i // 2, column=i % 2, padx=(0, 4), pady=2, sticky='ew')
+        tag_btns[key] = b
+    chips_frame.columnconfigure(0, weight=1)
+    chips_frame.columnconfigure(1, weight=1)
+
+    # ── Notes ─────────────────────────────────────────────────────────────────
+    tk.Frame(dlg, bg=DBORD, height=1).pack(fill='x', padx=16, pady=(2, 6))
+    tk.Label(dlg, text="Additional details  (optional):",
+             font=('Helvetica', 9, 'bold'), bg=DBG, fg=DBRI).pack(
+                 anchor='w', padx=16, pady=(0, 4))
+
+    notes_text = tk.Text(dlg, height=4, font=('Helvetica', 10),
+                         bg='#0d1117', fg=DBRI, insertbackground=DBRI,
+                         relief='flat', highlightthickness=1,
+                         highlightbackground=DBORD, highlightcolor=DACC,
+                         wrap='word')
+    notes_text.pack(fill='x', padx=16, pady=(0, 8))
+
+    # ── Confirm label + buttons ───────────────────────────────────────────────
+    tk.Frame(dlg, bg=DBORD, height=1).pack(fill='x', padx=16, pady=(0, 8))
+
+    confirm_lbl = tk.Label(dlg, text="", font=('Helvetica', 9),
+                           bg=DBG, fg='#4caf50', justify='left', wraplength=460)
+    confirm_lbl.pack(anchor='w', padx=16, pady=(0, 4))
+
+    def _trigger_retrain():
+        _ai = pathlib.Path.home() / "ai-lighting"
+        try:
+            subprocess.Popen(
+                [sys.executable, str(_ai / "main.py"), "train-placer", "--synthetic"],
+                cwd=str(_ai), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            msg = confirm_lbl.cget("text")
+            confirm_lbl.configure(text=msg + "\nBackground retraining triggered.")
+        except Exception:
+            pass
+
+    def _submit():
+        tags  = [k for k, v in tag_vars.items() if v.get()]
+        notes = notes_text.get("1.0", "end").strip()
+        if not tags and not notes:
+            confirm_lbl.configure(
+                text="Select at least one issue or add a note first.", fg='#ff9800')
+            return
+        import time as _t_, requests as _req
+        correction = {
+            "tags": tags, "description": notes,
+            "source": "gui_feedback", "timestamp": _t_.time(),
+        }
+        try:
+            submit_btn.configure(state='disabled', text="Submitting…")
+            r = _req.post(
+                f"{_API_BASE}/corrections",
+                json={"job_id": jid, "corrections": [correction]},
+                timeout=10,
+            )
+            if r.ok:
+                n = r.json().get("total_corrections", "?")
+                confirm_lbl.configure(
+                    text=f"✓ Correction #{n} saved — AI will learn from this.",
+                    fg='#4caf50')
+                submit_btn.configure(
+                    state='disabled', text="✓ Submitted",
+                    bg='#1a3a1a', fg='#4caf50')
+                _trigger_retrain()
+            else:
+                confirm_lbl.configure(
+                    text=f"Server error {r.status_code} — try again.", fg='#ff5c5c')
+                submit_btn.configure(state='normal', text="Submit Correction")
+        except Exception as ex:
+            confirm_lbl.configure(text=f"Error: {ex}", fg='#ff5c5c')
+            submit_btn.configure(state='normal', text="Submit Correction")
+
+    btn_row = tk.Frame(dlg, bg=DBG)
+    btn_row.pack(fill='x', padx=16, pady=(0, 14))
+
+    submit_btn = tk.Button(btn_row, text="Submit Correction",
+                           font=('Helvetica', 11, 'bold'),
+                           bg=DACC, fg='#111419',
+                           activebackground='#e65100', activeforeground='#111419',
+                           relief='flat', padx=20, pady=8, cursor='hand2',
+                           command=_submit)
+    submit_btn.pack(side='left')
+    tk.Button(btn_row, text="Close",
+              font=('Helvetica', 11),
+              bg='#1e2330', fg=DMUT,
+              activebackground=DBORD, activeforeground=DBRI,
+              relief='flat', padx=16, pady=8, cursor='hand2',
+              command=dlg.destroy).pack(side='left', padx=(8, 0))
+
+    dlg.bind('<Escape>', lambda e: dlg.destroy())
+
+
 # ── Step 0: full pipeline analysis dialog ────────────────────────────────────
 
 def open_analysis_dialog():
@@ -221,7 +406,10 @@ def open_analysis_dialog():
     export_row = tk.Frame(dlg, bg=DBG)
     export_row.pack(fill='x', padx=16, pady=(2, 12))
 
-    def _show_results(result: dict):
+    def _show_results(result: dict, job_id: str = ""):
+        _last_job_id[0]     = job_id
+        _last_job_result[0] = result
+
         results_title.pack(anchor='w', pady=(0, 4))
         for w in counts_frame.winfo_children():
             w.destroy()
@@ -280,7 +468,15 @@ def open_analysis_dialog():
                       relief='flat', padx=10, pady=6, cursor='hand2',
                       command=lambda p=epath: _open_export(p)).pack(side='left', padx=(0, 4))
 
-        _last_job_result[0] = result
+        # Feedback button — only shown when we have a real job_id
+        if job_id:
+            tk.Button(export_row, text="✎ Correct",
+                      font=('Helvetica', 10, 'bold'),
+                      bg='#1a1405', fg='#ff9800',
+                      activebackground='#2a2008', activeforeground='#ffb74d',
+                      relief='flat', padx=10, pady=6, cursor='hand2',
+                      command=lambda jid=job_id: open_feedback_dialog(jid)).pack(
+                          side='left', padx=(12, 0))
 
     # ── On open: show last completed job ─────────────────────────────────────
     def _load_latest():
@@ -294,7 +490,8 @@ def open_analysis_dialog():
                     if jr.ok:
                         res = jr.json().get("result")
                         if res:
-                            dlg.after(0, lambda r=res: _show_results(r))
+                            _jid = jobs[0]['job_id']
+                            dlg.after(0, lambda r=res, jid=_jid: _show_results(r, jid))
                             dlg.after(0, lambda: _log(
                                 f"Showing last job ({jobs[0]['job_id']}) — "
                                 "click ▶ Run to re-analyse."))
@@ -377,7 +574,7 @@ def open_analysis_dialog():
                             if _n:
                                 _log_q.append(f"  Type {_tt}: {_n}")
                         _log_q.append("=" * 48)
-                        dlg.after(0, lambda r=result: _show_results(r))
+                        dlg.after(0, lambda r=result, jid=job_id: _show_results(r, jid))
                         dlg.after(0, lambda _n=n: status_lbl.configure(
                             text=f"{_n} lights placed ✓", fg='#4caf50'))
                         break
@@ -425,6 +622,7 @@ _MAX_CUSTOM_DESCS    = 15
 _API_BASE            = "http://localhost:8000"
 _last_dwg_path:   list = [None]   # mutable cell — pathlib.Path or None
 _last_job_result: list = [None]   # mutable cell — result dict or None
+_last_job_id:     list = [None]   # mutable cell — last completed job_id str
 
 
 def _load_custom_descs() -> list:
@@ -1579,6 +1777,12 @@ make_card(
     '4', 'Place Lights',
     'Insert all luminaire symbols,\nlegend, and title block into the drawing.',
     'LIGHTINGAI_PLACE', '#4caf50'
+)
+
+make_card(
+    '5', 'Correct Placement  ✎',
+    'Flag bad light positions — trains the AI\nso future placements are more accurate.',
+    lambda: open_feedback_dialog(_last_job_id[0] or ""), '#ff9800'
 )
 
 # ── Utility row ───────────────────────────────────────────────────────────────
