@@ -134,10 +134,24 @@ def open_feedback_dialog(job_id: str = ""):
     """
     jid = job_id or (_last_job_id[0] or "")
     if not jid:
+        # Try fetching the latest completed job from the API
+        try:
+            import requests as _rq
+            r = _rq.get(f"{_API_BASE}/history?limit=1", timeout=5)
+            if r.ok:
+                jobs = r.json().get("jobs", [])
+                if jobs and jobs[0]["status"] == "done":
+                    jid = jobs[0]["job_id"]
+                    _last_job_id[0] = jid
+        except Exception:
+            pass
+    if not jid:
         from tkinter import messagebox
         messagebox.showwarning(
-            "No Job",
-            "Run an analysis first — then you can give feedback on the placement.",
+            "No Placement Found",
+            "No completed placement job found.\n\n"
+            "Run LIGHTINGAI_GRID in AutoCAD first to generate a placement,\n"
+            "then come back here to give feedback.",
             parent=root,
         )
         return
@@ -1671,7 +1685,7 @@ root.resizable(False, False)
 
 root.update_idletasks()
 sw = root.winfo_screenwidth()
-root.geometry(f"296x600+{sw - 316}+44")
+root.geometry(f"296x540+{sw - 316}+44")
 
 root.attributes('-topmost', True)
 root.lift()
@@ -1756,31 +1770,25 @@ def make_card(step_num: str, title: str, desc: str,
 
 # ── Four workflow steps ───────────────────────────────────────────────────────
 make_card(
-    '1', 'Analyse Floor Plan',
-    'Pick a DWG / PDF, run the AI pipeline,\nand view results + export links here.',
-    open_analysis_dialog, '#2196f3'
-)
-
-make_card(
-    '2', 'Draw Grid',
-    'Auto-detect the store outline and draw\nthe ceiling grid at your chosen pitch.',
+    '1', 'Draw Grid',
+    'Choose line thickness and colour, then draw\nthe ceiling grid on the active AutoCAD drawing.',
     open_grid_dialog, '#7b8ba8'
 )
 
 make_card(
-    '3', 'Configure Symbols  ★',
+    '2', 'Configure Symbols  ★',
     'Click shapes and colours for each light type.\nOpens a visual picker — no typing needed.',
     open_config_dialog, '#e040fb'
 )
 
 make_card(
-    '4', 'Place Lights',
+    '3', 'Place Lights',
     'Insert all luminaire symbols,\nlegend, and title block into the drawing.',
     'LIGHTINGAI_PLACE', '#4caf50'
 )
 
 make_card(
-    '5', 'Correct Placement  ✎',
+    '4', 'Correct Placement  ✎',
     'Flag bad light positions — trains the AI\nso future placements are more accurate.',
     lambda: open_feedback_dialog(_last_job_id[0] or ""), '#ff9800'
 )
