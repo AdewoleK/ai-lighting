@@ -633,7 +633,6 @@ def open_analysis_dialog():
 
 # ── Step 1: grid line-thickness + color picker ───────────────────────────────
 _GRID_CFG_FILE  = pathlib.Path.home() / "ai-lighting" / "lightingai_grid_config.json"
-_SUMMARY_FILE        = pathlib.Path.home() / "ai-lighting" / "lightingai_summary.json"
 _CUSTOM_DESCS_FILE   = pathlib.Path.home() / "ai-lighting" / "lightingai_custom_descs.json"
 _MAX_CUSTOM_DESCS    = 15
 _API_BASE            = "http://localhost:8000"
@@ -1663,6 +1662,11 @@ def open_config_dialog():
         threading.Thread(target=_regen, daemon=True).start()
 
         dlg.destroy()
+        # Immediately refresh the types legend on the main panel
+        try:
+            refresh_lt_panel()
+        except Exception:
+            pass
 
     tk.Button(btn_row, text="Save & Apply",
               font=('Helvetica', 12, 'bold'),
@@ -1833,96 +1837,93 @@ for label, cmd in [('Clear All', 'LIGHTINGAI_CLEAR'), ('Status', 'LIGHTINGAI_STA
                   command=lambda c=cmd: send_cmd(c))
     b.pack(side='left', fill='x', expand=True, padx=(0, 4))
 
-# ── Luminaire Schedule panel ──────────────────────────────────────────────────
+# ── Luminaire Types panel ─────────────────────────────────────────────────────
+_TYPECONFIG_FILE = pathlib.Path.home() / "ai-lighting" / "lightingai_typeconfig.json"
+
 tk.Frame(_sf, bg=BORDER, height=1).pack(fill='x', padx=10, pady=(6, 0))
 
-sched_hdr = tk.Frame(_sf, bg=BG)
-sched_hdr.pack(fill='x', padx=10, pady=(6, 0))
-tk.Label(sched_hdr, text='Luminaire Schedule',
+_lt_hdr = tk.Frame(_sf, bg=BG)
+_lt_hdr.pack(fill='x', padx=10, pady=(6, 0))
+tk.Label(_lt_hdr, text='Luminaire Types',
          font=('Helvetica', 11, 'bold'), bg=BG, fg=BRIGHT).pack(side='left')
 
-_sched_refresh_btn = tk.Button(sched_hdr, text='↻',
-                               font=('Helvetica', 11), bg=BG, fg=MUTED,
-                               relief='flat', bd=0, padx=6,
-                               activebackground=BG, activeforeground=BRIGHT,
-                               cursor='hand2')
-_sched_refresh_btn.pack(side='right')
+_lt_body = tk.Frame(_sf, bg=BG)
+_lt_body.pack(fill='x', padx=10, pady=(4, 0))
 
-sched_body = tk.Frame(_sf, bg=BG)
-sched_body.pack(fill='x', padx=10, pady=(2, 0))
-
-# Placeholder label — replaced by rows once summary.json exists
-_sched_placeholder = tk.Label(sched_body,
-    text='No data yet — place lights to see the schedule.',
-    font=('Helvetica', 9), bg=BG, fg='#2e364a', anchor='w')
-_sched_placeholder.pack(fill='x')
-
-_sched_rows: list = []
-_sched_last_mtime: list = [0.0]   # mutable cell for closure
+_lt_rows:      list = []
+_lt_last_mtime: list = [0.0]
 
 
-def _build_sched_rows(summary: dict) -> None:
-    for w in _sched_rows:
+def _default_types() -> list:
+    """Fallback type list when no config file exists yet."""
+    return [
+        {"type": "A",  "shape": "Circle",   "color": "Magenta", "description": "Shelf interior"},
+        {"type": "AW", "shape": "Circle",   "color": "Orange",  "description": "Wall-adjacent shelf"},
+        {"type": "C",  "shape": "Diamond",  "color": "Cyan",    "description": "Corner zone"},
+        {"type": "D",  "shape": "Triangle", "color": "Yellow",  "description": "Checkout / service"},
+        {"type": "E",  "shape": "Cross",    "color": "Blue",    "description": "Track spotlight"},
+    ]
+
+
+def _build_lt_rows(entries: list) -> None:
+    for w in _lt_rows:
         try: w.destroy()
         except Exception: pass
-    _sched_rows.clear()
+    _lt_rows.clear()
 
-    by_type = summary.get("by_type", [])
-    for row in by_type:
-        t     = row.get("type", "?")
-        desc  = row.get("description", "")
-        count = row.get("count", 0)
-        watt  = row.get("watt_total", 0)
-        # Truncate description to fit panel width
-        if len(desc) > 28:
-            desc = desc[:26] + "…"
-        line = f"{t}  {desc:<28}  {count:>3}×  {watt:>6.0f} W"
-        lbl = tk.Label(sched_body, text=line,
-                       font=('Courier', 9), bg=BG, fg=MUTED, anchor='w')
-        lbl.pack(fill='x')
-        _sched_rows.append(lbl)
+    for entry in entries:
+        t     = entry.get("type", "?")
+        shape = entry.get("shape", "Circle")
+        color = entry.get("color", "Magenta")
+        desc  = entry.get("description", "")
+        hex_c = COLOR_HEX.get(color, '#888888')
 
-    # Totals line
-    total_c = summary.get("total_count", 0)
-    total_w = summary.get("total_watt", 0)
-    area    = summary.get("floor_area_m2")
-    wpm2    = summary.get("watt_per_m2")
-    tot1 = f"Total: {total_c} fixtures    {total_w:.0f} W"
-    lbl1 = tk.Label(sched_body, text=tot1,
-                    font=('Helvetica', 9, 'bold'), bg=BG, fg=BRIGHT, anchor='w')
-    lbl1.pack(fill='x', pady=(2, 0))
-    _sched_rows.append(lbl1)
+        row = tk.Frame(_lt_body, bg=BG)
+        row.pack(fill='x', pady=2)
 
-    if area and wpm2 is not None:
-        tot2 = f"Floor: {area:.0f} m²    Lighting load: {wpm2:.2f} W/m²"
-        lbl2 = tk.Label(sched_body, text=tot2,
-                        font=('Helvetica', 9), bg=BG, fg=MUTED, anchor='w')
-        lbl2.pack(fill='x')
-        _sched_rows.append(lbl2)
+        # Shape swatch (20×20 canvas)
+        cv = tk.Canvas(row, width=20, height=20, bg=BG,
+                       highlightthickness=0, bd=0)
+        cv.pack(side='left', padx=(0, 6))
+        draw_shape(cv, shape, hex_c, size=20)
+
+        # Type label
+        tk.Label(row, text=t,
+                 font=('Helvetica', 10, 'bold'),
+                 bg=BG, fg=hex_c, width=4, anchor='w').pack(side='left')
+
+        # Description (truncated)
+        if len(desc) > 26:
+            desc = desc[:24] + "…"
+        tk.Label(row, text=desc,
+                 font=('Helvetica', 9),
+                 bg=BG, fg=MUTED, anchor='w').pack(side='left')
+
+        _lt_rows.append(row)
 
 
-def refresh_schedule() -> None:
-    if not _SUMMARY_FILE.exists():
-        return
+def refresh_lt_panel() -> None:
+    """Reload the luminaire types panel from the config file (or defaults)."""
     try:
-        mtime = _SUMMARY_FILE.stat().st_mtime
-        if mtime == _sched_last_mtime[0]:
-            return
-        _sched_last_mtime[0] = mtime
-        summary = json.loads(_SUMMARY_FILE.read_text(encoding='utf-8'))
-        _sched_placeholder.pack_forget()
-        _build_sched_rows(summary)
+        if _TYPECONFIG_FILE.exists():
+            mtime = _TYPECONFIG_FILE.stat().st_mtime
+            if mtime == _lt_last_mtime[0]:
+                return
+            _lt_last_mtime[0] = mtime
+            entries = json.loads(_TYPECONFIG_FILE.read_text(encoding='utf-8'))
+        else:
+            entries = _default_types()
+        _build_lt_rows(entries)
     except Exception:
         pass
 
 
-def _poll_schedule():
-    refresh_schedule()
-    root.after(5000, _poll_schedule)
+def _poll_lt_panel():
+    refresh_lt_panel()
+    root.after(4000, _poll_lt_panel)
 
 
-_sched_refresh_btn.configure(command=refresh_schedule)
-_poll_schedule()
+_poll_lt_panel()
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 tk.Frame(_sf, bg=BORDER, height=1).pack(fill='x', padx=10, pady=(6, 0))
