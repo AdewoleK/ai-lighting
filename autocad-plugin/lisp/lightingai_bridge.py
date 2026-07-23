@@ -1044,6 +1044,81 @@ def write_commands_lsp(out_path: Path, result: dict,
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _run_pipeline_direct(dwg: Path, project: str, customer: str, concept: str) -> dict:
+    """
+    Run the full pipeline in-process so all logging appears in this terminal.
+    Returns the same result dict the API would return.
+    Falls back to raising ImportError if dependencies are missing.
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(_AI_DIR))
+
+    from services.log import configure_logging
+    from services.parser.pdf_parser import RealPlanParser
+    from services.classifier.room_classifier_real import RealRoomClassifier
+    from services.placer.real_placer import RealLuminairePlacer
+    from services.exporter.exporter import export_dwg, export_excel, export_pdf
+    from config import EXPORTS_DIR
+    import uuid as _uuid
+
+    configure_logging(verbose=False)
+
+    plan       = RealPlanParser().parse(dwg)
+    classified = RealRoomClassifier().classify(plan)
+    result_obj = RealLuminairePlacer().place_all(plan, classified)
+
+    job_id = _uuid.uuid4().hex[:8]
+    stem   = f"{job_id}_{dwg.stem}"
+    pfx    = str(EXPORTS_DIR / stem)
+
+    source_dxf = str(dwg) if dwg.suffix in ('.dxf', '.dwg') else None
+    dwg_out  = export_dwg(result_obj, classified,
+                          source_dxf_path=source_dxf,
+                          output_path=pfx + "_luminaires.dxf",
+                          project_name=project, customer=customer,
+                          concept_id=concept)
+    xlsx_out = export_excel(result_obj, classified,
+                            project_name=project, customer=customer,
+                            concept_id=concept,
+                            output_path=pfx + "_schedule.xlsx")
+    pdf_out  = export_pdf(result_obj, classified,
+                          concept_id=concept, customer=customer,
+                          project_name=project,
+                          output_path=pfx + "_documentation")
+
+    placed_data = [
+        {"id": i, "x": round(lp.x), "y": round(lp.y),
+         "rotation": lp.rotation,
+         "zone_type": lp.zone_type, "lumi_type": lp.lumi_type,
+         "product_code": lp.product_code, "description": lp.description,
+         "wattage": lp.wattage, "lux_output": lp.lux_output,
+         "mounting_type": lp.mounting_type,
+         "beam_angle_deg": lp.beam_angle_deg,
+         "grid_snapped": lp.grid_snapped,
+         "shelf_aligned": lp.shelf_aligned}
+        for i, lp in enumerate(result_obj.placed)
+    ]
+
+    return {
+        "total_luminaires": len(result_obj.placed),
+        "total_wattage":    round(result_obj.total_wattage()),
+        "type_A":  len(result_obj.by_type("A")),
+        "type_AW": len(result_obj.by_type("AW")),
+        "type_B":  len(result_obj.by_type("B")),
+        "type_C":  len(result_obj.by_type("C")),
+        "type_D":  len(result_obj.by_type("D")),
+        "type_E":  len(result_obj.by_type("E")),
+        "type_W":  len(result_obj.by_type("W")),
+        "type_P":  len(result_obj.by_type("P")),
+        "placed":  placed_data,
+        "exports": {
+            "dxf":  str(dwg_out),
+            "xlsx": str(xlsx_out),
+            "pdf":  str(pdf_out),
+        },
+    }
+
+
 def main():
     args = parse_args()
     out  = Path(args.out)
@@ -1059,49 +1134,53 @@ def main():
     if not dwg.exists():
         sys.exit(f"ERROR: File not found: {dwg}")
 
-    # ── 1. Health check ───────────────────────────────────────────────────────
-    print(f"\n[LightingAI] Connecting to {args.api} …")
-    if not check_health(args.api):
-        sys.exit(
-            f"ERROR: Cannot reach backend at {args.api}\n"
-            f"  Make sure the Python API is running:\n"
-            f"  cd ~/ai-lighting && uvicorn services.api.main:app --port 8000"
-        )
-    print("[LightingAI] Backend online.")
-
-    # ── 2. Read grid origin (optional — pipeline auto-detects if not set) ─────
-    origin_info = ""
+    # ── Read grid origin ──────────────────────────────────────────────────────
     if ORIGIN_FILE.exists():
         try:
             origin = json.loads(ORIGIN_FILE.read_text())
-            origin_info = (f"  Grid origin: X={origin['x']:.0f}  "
-                           f"Y={origin['y']:.0f}  pitch={origin['pitch']} mm")
-            print(f"[LightingAI] {origin_info}")
+            print(f"[LightingAI] Grid origin: X={origin['x']:.0f}  "
+                  f"Y={origin['y']:.0f}  pitch={origin['pitch']} mm")
         except Exception:
             pass
     else:
-        print("[LightingAI] No grid origin file found — pipeline will auto-detect.")
-        print("             (For better accuracy: run LIGHTINGAI_SETUP in AutoCAD first)")
+        print("[LightingAI] No grid origin file — pipeline will auto-detect.")
 
-    # ── 3. Upload ─────────────────────────────────────────────────────────────
-    print(f"[LightingAI] Uploading {dwg.name} ({dwg.stat().st_size // 1024} KB)…")
-    job_id = submit_plan(args.api, dwg, args.project, args.customer, args.concept)
-    print(f"[LightingAI] Job {job_id} queued — polling…")
+    # ── Run pipeline: direct (logs in this terminal) or via API fallback ──────
+    print(f"\n[LightingAI] Processing {dwg.name} ({dwg.stat().st_size // 1024} KB)…\n")
+    result = None
+    try:
+        result = _run_pipeline_direct(dwg, args.project, args.customer, args.concept)
+    except ImportError as ie:
+        print(f"[LightingAI] Direct mode unavailable ({ie}) — trying API fallback…")
+    except Exception as e:
+        sys.exit(f"\nERROR: Pipeline failed: {e}")
 
-    # ── 4. Poll ───────────────────────────────────────────────────────────────
-    job = poll_job(args.api, job_id)
-    if job["status"] == "error":
-        sys.exit(f"\nERROR: Pipeline failed: {job['message']}")
+    if result is None:
+        # API fallback — logs appear in the uvicorn server terminal instead
+        print(f"[LightingAI] Connecting to {args.api} …")
+        if not check_health(args.api):
+            sys.exit(
+                f"ERROR: Cannot reach backend at {args.api}\n"
+                f"  Start it with:  cd ~/ai-lighting && "
+                f"uvicorn services.api.main:app --port 8000"
+            )
+        print("[LightingAI] Backend online.")
+        print(f"[LightingAI] Uploading {dwg.name}…")
+        job_id = submit_plan(args.api, dwg, args.project, args.customer, args.concept)
+        print(f"[LightingAI] Job {job_id} queued — polling…")
+        job = poll_job(args.api, job_id)
+        if job["status"] == "error":
+            sys.exit(f"\nERROR: Pipeline failed: {job['message']}")
+        result = job["result"]
 
-    result = job["result"]
     print(f"\n[LightingAI] Pipeline complete:")
     print(f"  Total luminaires : {result['total_luminaires']}")
     print(f"  Total wattage    : {result['total_wattage']:.0f} W")
-    print(f"  Type A/B/C/D/E   : "
-          f"{result['type_A']}/{result['type_B']}/"
+    print(f"  Type A/AW/B/C/D/E: "
+          f"{result['type_A']}/{result.get('type_AW',0)}/{result['type_B']}/"
           f"{result['type_C']}/{result['type_D']}/{result['type_E']}")
 
-    # ── 5. Write LISP commands file ───────────────────────────────────────────
+    # ── Write LISP commands file ───────────────────────────────────────────────
     print(f"\n[LightingAI] Writing AutoCAD commands…")
     write_commands_lsp(out, result, args.project, args.customer, args.concept)
 
