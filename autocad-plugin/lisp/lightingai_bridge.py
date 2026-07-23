@@ -244,15 +244,15 @@ def load_type_config() -> dict:
         for e in entries:
             t = e.get("type", "")
             raw_color      = e.get("color", "")
-        config_aci     = COLOR_NAME_ACI.get(raw_color, None)
-        type_def_aci   = TYPE_ACI.get(t, 6)
-        # If config has Magenta (stale LIGHTINGAI_CONFIG default) but
-        # this type's TYPE_ACI is not Magenta, trust TYPE_ACI.
-        if config_aci == 6 and type_def_aci != 6:
-            resolved_aci = type_def_aci
-        else:
-            resolved_aci = config_aci if config_aci is not None else type_def_aci
-        cfg[t] = {
+            config_aci     = COLOR_NAME_ACI.get(raw_color, None)
+            type_def_aci   = TYPE_ACI.get(t, 6)
+            # If config has Magenta (stale LIGHTINGAI_CONFIG default) but
+            # this type's TYPE_ACI is not Magenta, trust TYPE_ACI.
+            if config_aci == 6 and type_def_aci != 6:
+                resolved_aci = type_def_aci
+            else:
+                resolved_aci = config_aci if config_aci is not None else type_def_aci
+            cfg[t] = {
                 "shape":       e.get("shape", DEFAULT_SHAPES.get(t, "Circle")),
                 "aci":         resolved_aci,
                 "description": e.get("description", ""),
