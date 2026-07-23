@@ -72,15 +72,15 @@ SUBPOS_MM: dict[str, tuple[float, float]] = {
 
 TYPE_CONFIG_FILE = _AI_DIR / "lightingai_typeconfig.json"
 
-DEFAULT_SHAPES = {    # default symbol shape per type letter (used in legend only)
+DEFAULT_SHAPES = {    # default symbol shape per type letter — every type distinct
     "A":  "Circle",
-    "AW": "Circle",
+    "AW": "Star",
     "B":  "Square",
     "C":  "Diamond",
     "D":  "Triangle",
     "E":  "Cross",
     "W":  "Hexagon",
-    "P":  "Hexagon",
+    "P":  "Pentagon",
 }
 
 COLOR_NAME_ACI = {    # human-readable color name → ACI value

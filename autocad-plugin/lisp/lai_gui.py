@@ -73,8 +73,8 @@ COLOR_HEX = {
 }
 COLORS = list(COLOR_HEX.keys())
 
-SHAPE_DEFAULTS = ['Circle', 'Circle',  'Diamond', 'Triangle', 'Cross', 'Square']
-COLOR_DEFAULTS = ['Magenta', 'Orange', 'Cyan',    'Yellow',   'Blue',  'Red']
+SHAPE_DEFAULTS = ['Circle', 'Star',   'Diamond', 'Triangle', 'Cross', 'Square']
+COLOR_DEFAULTS = ['Magenta', 'Orange', 'Cyan',   'Yellow',   'Blue',  'Red']
 
 # Canonical Rossmann luminaire types in tab order
 _ROSSMANN_TYPES = ['A', 'AW', 'C', 'D', 'E', 'B']
@@ -1858,7 +1858,7 @@ def _default_types() -> list:
     """Fallback type list when no config file exists yet."""
     return [
         {"type": "A",  "shape": "Circle",   "color": "Magenta", "description": "Shelf interior"},
-        {"type": "AW", "shape": "Circle",   "color": "Orange",  "description": "Wall-adjacent shelf"},
+        {"type": "AW", "shape": "Star",     "color": "Orange",  "description": "Wall-adjacent shelf"},
         {"type": "C",  "shape": "Diamond",  "color": "Cyan",    "description": "Corner zone"},
         {"type": "D",  "shape": "Triangle", "color": "Yellow",  "description": "Checkout / service"},
         {"type": "E",  "shape": "Cross",    "color": "Blue",    "description": "Track spotlight"},
