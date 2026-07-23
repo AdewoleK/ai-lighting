@@ -129,7 +129,7 @@ def draw_shape(canvas, shape_name: str, hex_color: str, size: int = 32) -> None:
 
 def open_analysis_dialog():
     import threading
-    import tkinter.filedialog as _fd
+    import time as _time
 
     dlg = tk.Toplevel(root)
     dlg.title("Analyse Floor Plan")
@@ -137,19 +137,18 @@ def open_analysis_dialog():
     dlg.resizable(True, True)
     dlg.attributes('-topmost', True)
 
-    W, H = 640, 700
+    W, H = 560, 580
     sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
     dlg.geometry(f"{W}x{H}+{max(0, (sw - W) // 2)}+{max(0, (sh - H) // 4)}")
-    dlg.minsize(520, 500)
+    dlg.minsize(480, 440)
 
-    DBG    = '#111419'
-    DCARD  = '#181c24'
-    DBRI   = '#e0e6f0'
-    DMUT   = '#5c6680'
-    DBORD  = '#252c3a'
-    DACC   = '#2196f3'
+    DBG   = '#111419'
+    DBRI  = '#e0e6f0'
+    DMUT  = '#5c6680'
+    DBORD = '#252c3a'
+    DACC  = '#2196f3'
 
-    # ── Header ─────────────────────────────────────────────────────────────
+    # ── Header ──────────────────────────────────────────────────────────────
     hdr = tk.Frame(dlg, bg='#181c24')
     hdr.pack(fill='x')
     tk.Label(hdr, text="Analyse Floor Plan",
@@ -159,63 +158,21 @@ def open_analysis_dialog():
              font=('Helvetica', 10), bg='#181c24', fg=DMUT, pady=10).pack(side='left')
     tk.Frame(dlg, bg=DBORD, height=1).pack(fill='x')
 
-    # ── File picker ─────────────────────────────────────────────────────────
-    fp_frame = tk.Frame(dlg, bg=DBG)
-    fp_frame.pack(fill='x', padx=16, pady=(12, 4))
-    tk.Label(fp_frame, text="Floor Plan File:",
-             font=('Helvetica', 10, 'bold'), bg=DBG, fg=DBRI).pack(anchor='w')
+    # ── Info ────────────────────────────────────────────────────────────────
+    info_frame = tk.Frame(dlg, bg=DBG)
+    info_frame.pack(fill='x', padx=16, pady=(12, 8))
+    tk.Label(info_frame,
+             text="Uses the floor plan currently open in AutoCAD.\n"
+                  "Draws the ceiling grid and runs the AI placement engine.",
+             font=('Helvetica', 10), bg=DBG, fg=DMUT,
+             justify='left', anchor='w').pack(anchor='w')
 
-    file_row = tk.Frame(fp_frame, bg=DBG)
-    file_row.pack(fill='x', pady=(4, 0))
-
-    file_var = tk.StringVar(value=str(_last_dwg_path[0]) if _last_dwg_path[0] else "")
-    file_entry = tk.Entry(file_row, textvariable=file_var,
-                          font=('Helvetica', 10),
-                          bg='#0d1117', fg=DBRI,
-                          insertbackground=DBRI,
-                          relief='flat', highlightthickness=1,
-                          highlightbackground=DBORD, highlightcolor=DACC)
-    file_entry.pack(side='left', fill='x', expand=True, ipady=6, padx=(0, 8))
-
-    def browse_file():
-        path = _fd.askopenfilename(
-            title="Select Floor Plan",
-            filetypes=[("CAD & PDF", "*.dwg *.dxf *.pdf"), ("All files", "*.*")],
-        )
-        if path:
-            file_var.set(path)
-            _last_dwg_path[0] = pathlib.Path(path)
-
-    tk.Button(file_row, text="Browse…",
-              font=('Helvetica', 10), bg='#1e2330', fg=DBRI,
-              activebackground=DBORD, relief='flat', padx=10, pady=4,
-              cursor='hand2', command=browse_file).pack(side='left')
-
-    # ── Project / Customer ──────────────────────────────────────────────────
-    meta_frame = tk.Frame(dlg, bg=DBG)
-    meta_frame.pack(fill='x', padx=16, pady=(8, 4))
-
-    project_var  = tk.StringVar(value="Rossmann EG")
-    customer_var = tk.StringVar(value="Dirk Rossmann GmbH")
-
-    for mlabel, mvar in [("Project:", project_var), ("Customer:", customer_var)]:
-        mrow = tk.Frame(meta_frame, bg=DBG)
-        mrow.pack(fill='x', pady=2)
-        tk.Label(mrow, text=mlabel, font=('Helvetica', 9), bg=DBG, fg=DMUT,
-                 width=9, anchor='w').pack(side='left')
-        me = tk.Entry(mrow, textvariable=mvar, font=('Helvetica', 10),
-                      bg='#0d1117', fg=DBRI, insertbackground=DBRI,
-                      relief='flat', highlightthickness=1,
-                      highlightbackground=DBORD, highlightcolor=DACC)
-        me.pack(side='left', fill='x', expand=True, ipady=5)
-
-    # ── Run button ──────────────────────────────────────────────────────────
-    tk.Frame(dlg, bg=DBORD, height=1).pack(fill='x', padx=16, pady=(10, 6))
-
+    # ── Run button ───────────────────────────────────────────────────────────
+    tk.Frame(dlg, bg=DBORD, height=1).pack(fill='x', padx=16, pady=(0, 8))
     run_row = tk.Frame(dlg, bg=DBG)
     run_row.pack(fill='x', padx=16, pady=(0, 8))
 
-    run_btn = tk.Button(run_row, text="▶  Analyse Floor Plan",
+    run_btn = tk.Button(run_row, text="▶  Run Analysis",
                         font=('Helvetica', 12, 'bold'),
                         bg=DACC, fg='#111419',
                         activebackground='#1565c0', activeforeground='#111419',
@@ -251,7 +208,7 @@ def open_analysis_dialog():
         log_text.see('end')
         log_text.configure(state='disabled')
 
-    # ── Results section ───────────────────────────────────────────────────────
+    # ── Results + exports ────────────────────────────────────────────────────
     tk.Frame(dlg, bg=DBORD, height=1).pack(fill='x', padx=16)
 
     results_area = tk.Frame(dlg, bg=DBG)
@@ -325,9 +282,30 @@ def open_analysis_dialog():
 
         _last_job_result[0] = result
 
+    # ── On open: show last completed job ─────────────────────────────────────
+    def _load_latest():
+        try:
+            import requests as _req
+            r = _req.get(f"{_API_BASE}/history?limit=1", timeout=5)
+            if r.ok:
+                jobs = r.json().get("jobs", [])
+                if jobs and jobs[0]["status"] == "done":
+                    jr = _req.get(f"{_API_BASE}/jobs/{jobs[0]['job_id']}", timeout=5)
+                    if jr.ok:
+                        res = jr.json().get("result")
+                        if res:
+                            dlg.after(0, lambda r=res: _show_results(r))
+                            dlg.after(0, lambda: _log(
+                                f"Showing last job ({jobs[0]['job_id']}) — "
+                                "click ▶ Run to re-analyse."))
+        except Exception:
+            pass
+
+    threading.Thread(target=_load_latest, daemon=True).start()
+
     # ── Run logic ─────────────────────────────────────────────────────────────
-    _running  = [False]
-    _log_q:  list = []
+    _running = [False]
+    _log_q: list = []
 
     def _flush_logs():
         while _log_q:
@@ -336,78 +314,81 @@ def open_analysis_dialog():
     def _drain():
         _flush_logs()
         if _running[0]:
-            dlg.after(200, _drain)
+            dlg.after(300, _drain)
         else:
-            _flush_logs()   # one final drain after worker exits
+            _flush_logs()
 
-    def _worker():
+    def _worker(t0: float):
         try:
-            import requests as _req
-            api = _API_BASE
+            import requests as _req, time as _t
 
-            _log_q.append("Checking API server…")
-            try:
-                hr = _req.get(f"{api}/health", timeout=5)
-                if not hr.ok or hr.json().get("status") != "ok":
-                    raise ConnectionError("unexpected response")
-                _log_q.append(f"[OK] API server is running at {api}")
-            except Exception:
-                _log_q.append(f"[ERROR] Cannot reach API at {api}")
-                _log_q.append("       Tip: open a terminal and run:")
-                _log_q.append("         cd ~/ai-lighting && python main.py api")
-                dlg.after(0, lambda: run_btn.configure(
-                    state='normal', text="▶  Analyse Floor Plan", bg=DACC))
+            _log_q.append("Command sent to AutoCAD (LIGHTINGAI_GRID).")
+            _log_q.append("Waiting for pipeline to start…")
+
+            job_id = None
+            deadline = _t.time() + 180   # 3-minute timeout
+            _t.sleep(5)                  # let AutoCAD register the command + bridge start
+
+            while _t.time() < deadline:
+                try:
+                    r = _req.get(f"{_API_BASE}/history?limit=1", timeout=5)
+                    if r.ok:
+                        jobs = r.json().get("jobs", [])
+                        if jobs:
+                            j = jobs[0]
+                            if j.get("created_at", 0) >= t0 - 5:
+                                job_id = j["job_id"]
+                                _log_q.append(f"Pipeline detected: job {job_id}")
+                                break
+                            elif j["status"] in ("processing", "queued"):
+                                job_id = j["job_id"]
+                                _log_q.append(f"Pipeline running: job {job_id}")
+                                break
+                except Exception:
+                    pass
+                _t.sleep(2)
+
+            if not job_id:
+                _log_q.append("[TIMEOUT] No pipeline job detected within 3 minutes.")
+                _log_q.append("Check that AutoCAD received LIGHTINGAI_GRID.")
                 dlg.after(0, lambda: status_lbl.configure(
-                    text="API not reachable", fg='#ff5c5c'))
+                    text="No job detected — check AutoCAD", fg='#ff5c5c'))
                 return
 
-            dwg = file_var.get().strip()
-            _log_q.append(f"Uploading: {pathlib.Path(dwg).name}")
-            with open(dwg, "rb") as fh:
-                pr = _req.post(
-                    f"{api}/process",
-                    files={"file": (pathlib.Path(dwg).name, fh, "application/octet-stream")},
-                    data={"project_name": project_var.get().strip() or "Rossmann EG",
-                          "customer":     customer_var.get().strip() or "Dirk Rossmann GmbH",
-                          "concept_id":   "rossmann_standard"},
-                    timeout=30,
-                )
-            pr.raise_for_status()
-            job_id = pr.json()["job_id"]
-            _log_q.append(f"Job ID: {job_id}")
-
-            import time
             last_msg = ""
             while True:
-                jr = _req.get(f"{api}/jobs/{job_id}", timeout=10)
-                jr.raise_for_status()
-                jdata  = jr.json()
-                jstat  = jdata["status"]
-                jmsg   = jdata.get("message", "")
-                if jmsg and jmsg != last_msg:
-                    _log_q.append(f"[{jstat.upper():<10}] {jmsg}")
-                    last_msg = jmsg
-                if jstat == "done":
-                    result = jdata.get("result", {})
-                    _log_q.append("=" * 50)
-                    n = result.get("total_luminaires", "?")
-                    w = result.get("total_wattage", 0)
-                    _log_q.append(f"DONE: {n} luminaires  {w:.0f} W")
-                    for _t in ("A", "AW", "B", "C", "D", "E"):
-                        _n = result.get(f"type_{_t}", 0)
-                        if _n:
-                            _log_q.append(f"  Type {_t}: {_n}")
-                    _log_q.append("=" * 50)
-                    dlg.after(0, lambda r=result: _show_results(r))
-                    dlg.after(0, lambda _n=n: status_lbl.configure(
-                        text=f"{_n} lights placed ✓", fg='#4caf50'))
-                    break
-                elif jstat == "error":
-                    _log_q.append(f"[ERROR] {jmsg}")
-                    dlg.after(0, lambda: status_lbl.configure(
-                        text="Pipeline failed — see log", fg='#ff5c5c'))
-                    break
-                time.sleep(1.5)
+                try:
+                    jr = _req.get(f"{_API_BASE}/jobs/{job_id}", timeout=10)
+                    jr.raise_for_status()
+                    jdata = jr.json()
+                    jstat = jdata["status"]
+                    jmsg  = jdata.get("message", "")
+                    if jmsg and jmsg != last_msg:
+                        _log_q.append(f"[{jstat.upper():<10}] {jmsg}")
+                        last_msg = jmsg
+                    if jstat == "done":
+                        result = jdata.get("result", {})
+                        n = result.get("total_luminaires", "?")
+                        w = result.get("total_wattage", 0)
+                        _log_q.append("=" * 48)
+                        _log_q.append(f"DONE: {n} luminaires  {w:.0f} W")
+                        for _tt in ("A", "AW", "B", "C", "D", "E"):
+                            _n = result.get(f"type_{_tt}", 0)
+                            if _n:
+                                _log_q.append(f"  Type {_tt}: {_n}")
+                        _log_q.append("=" * 48)
+                        dlg.after(0, lambda r=result: _show_results(r))
+                        dlg.after(0, lambda _n=n: status_lbl.configure(
+                            text=f"{_n} lights placed ✓", fg='#4caf50'))
+                        break
+                    elif jstat == "error":
+                        _log_q.append(f"[ERROR] {jmsg}")
+                        dlg.after(0, lambda: status_lbl.configure(
+                            text="Pipeline failed — see log", fg='#ff5c5c'))
+                        break
+                except Exception as poll_err:
+                    _log_q.append(f"[WARN] poll error: {poll_err}")
+                _t.sleep(2)
 
         except Exception as exc:
             _log_q.append(f"[FATAL] {exc}")
@@ -416,27 +397,22 @@ def open_analysis_dialog():
         finally:
             _running[0] = False
             dlg.after(0, lambda: run_btn.configure(
-                state='normal', text="▶  Analyse Floor Plan", bg=DACC))
+                state='normal', text="▶  Run Analysis", bg=DACC))
 
     def on_run():
         if _running[0]:
             return
-        dwg = file_var.get().strip()
-        if not dwg or not pathlib.Path(dwg).exists():
-            from tkinter import messagebox
-            messagebox.showwarning("No File",
-                                   "Please select a floor plan file first.", parent=dlg)
-            return
-        _last_dwg_path[0] = pathlib.Path(dwg)
         _running[0] = True
         run_btn.configure(state='disabled', text="Running…", bg='#1a3a5c')
-        status_lbl.configure(text="Starting pipeline…", fg=DMUT)
+        status_lbl.configure(text="Sending to AutoCAD…", fg=DMUT)
         results_title.pack_forget()
         counts_frame.pack_forget()
         for _w in export_row.winfo_children():
             _w.destroy()
-        threading.Thread(target=_worker, daemon=True).start()
-        dlg.after(200, _drain)
+        t0 = _time.time()
+        send_cmd('LIGHTINGAI_GRID')
+        threading.Thread(target=_worker, args=(t0,), daemon=True).start()
+        dlg.after(300, _drain)
 
     run_btn.configure(command=on_run)
 
