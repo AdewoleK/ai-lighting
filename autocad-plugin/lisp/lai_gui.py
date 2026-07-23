@@ -984,7 +984,7 @@ def open_config_dialog():
     dlg.attributes('-topmost', True)
     dlg.lift()
 
-    W = 460
+    W = 540
     sw = dlg.winfo_screenwidth()
     sh = dlg.winfo_screenheight()
     H = min(900, int(sh * 0.88))   # tall enough to show everything; caps at 88% of screen
@@ -1238,9 +1238,13 @@ def open_config_dialog():
               padx=10, pady=2, cursor='hand2',
               command=lambda: change_n(1)).pack(side='left', padx=(4, 0))
 
-    # ── Type selector tabs ───────────────────────────────────────────────────
-    tabs_frame = tk.Frame(dlg, bg='#111419')
-    tabs_frame.pack(fill='x', padx=16, pady=(8, 0))
+    # ── Type selector tabs (2 rows of 4) ─────────────────────────────────────
+    tabs_outer = tk.Frame(dlg, bg='#111419')
+    tabs_outer.pack(fill='x', padx=16, pady=(8, 0))
+    tabs_row1 = tk.Frame(tabs_outer, bg='#111419')
+    tabs_row1.pack(fill='x')
+    tabs_row2 = tk.Frame(tabs_outer, bg='#111419')
+    # tabs_row2 is shown/hidden by rebuild_tabs depending on type count
 
     type_btns = []
 
@@ -1258,17 +1262,23 @@ def open_config_dialog():
         for b in type_btns:
             b.pack_forget()
         n = num_types.get()
+        if n > 4:
+            tabs_row2.pack(fill='x', pady=(4, 0))
+        else:
+            tabs_row2.pack_forget()
         for j in range(n):
-            type_btns[j].pack(side='left', padx=2)
+            type_btns[j].pack(side='left', fill='x', expand=True, padx=2)
         cur = active_idx.get()
         select_type(cur if cur < n else n - 1)
 
+    # First 4 types live in row 1, remaining in row 2
     for i in range(8):
-        b = tk.Button(tabs_frame,
+        parent = tabs_row1 if i < 4 else tabs_row2
+        b = tk.Button(parent,
                       text=_ROSSMANN_TYPES[i],
                       font=('Helvetica', 12, 'bold'),
                       bg='#1e2330', fg='#8892a4',
-                      relief='flat', padx=14, pady=6,
+                      relief='flat', padx=10, pady=6,
                       cursor='hand2',
                       command=lambda x=i: select_type(x))
         type_btns.append(b)
