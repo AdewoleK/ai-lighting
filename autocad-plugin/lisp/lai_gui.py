@@ -73,8 +73,11 @@ COLOR_HEX = {
 }
 COLORS = list(COLOR_HEX.keys())
 
-SHAPE_DEFAULTS = ['Circle', 'Square', 'Diamond', 'Triangle', 'Cross', 'Hexagon']
-COLOR_DEFAULTS = ['Magenta', 'Red', 'Cyan', 'Yellow', 'Blue', 'Green', 'Magenta']
+SHAPE_DEFAULTS = ['Circle', 'Circle',  'Diamond', 'Triangle', 'Cross', 'Square']
+COLOR_DEFAULTS = ['Magenta', 'Orange', 'Cyan',    'Yellow',   'Blue',  'Red']
+
+# Canonical Rossmann luminaire types in tab order
+_ROSSMANN_TYPES = ['A', 'AW', 'C', 'D', 'E', 'B']
 
 
 def draw_shape(canvas, shape_name: str, hex_color: str, size: int = 32) -> None:
@@ -979,9 +982,9 @@ def open_config_dialog():
     # ── Per-type state ──────────────────────────────────────────────────────
     selections = [
         {
-            'shape':       _existing.get(chr(65+i), {}).get('shape',       SHAPE_DEFAULTS[i]),
-            'color':       _existing.get(chr(65+i), {}).get('color',       COLOR_DEFAULTS[i]),
-            'description': _existing.get(chr(65+i), {}).get('description', ''),
+            'shape':       _existing.get(_ROSSMANN_TYPES[i], {}).get('shape',       SHAPE_DEFAULTS[i]),
+            'color':       _existing.get(_ROSSMANN_TYPES[i], {}).get('color',       COLOR_DEFAULTS[i]),
+            'description': _existing.get(_ROSSMANN_TYPES[i], {}).get('description', ''),
         }
         for i in range(6)
     ]
@@ -1054,7 +1057,7 @@ def open_config_dialog():
                 return
             n = num_types.get()
             config = [
-                {"type":        chr(65 + i),
+                {"type":        _ROSSMANN_TYPES[i],
                  "shape":       selections[i]['shape'],
                  "color":       selections[i]['color'],
                  "description": selections[i].get('description', '').strip()}
@@ -1238,7 +1241,7 @@ def open_config_dialog():
 
     for i in range(6):
         b = tk.Button(tabs_frame,
-                      text=chr(65 + i),
+                      text=_ROSSMANN_TYPES[i],
                       font=('Helvetica', 12, 'bold'),
                       bg='#1e2330', fg='#8892a4',
                       relief='flat', padx=14, pady=6,
@@ -1617,9 +1620,9 @@ def open_config_dialog():
         import pathlib, threading
         n = num_types.get()
         # Types the GUI manages (A through the nth letter, e.g. A-E for n=5)
-        gui_types = {chr(65 + i) for i in range(n)}
+        gui_types = set(_ROSSMANN_TYPES[:n])
         config = [
-            {"type":        chr(65 + i),
+            {"type":        _ROSSMANN_TYPES[i],
              "shape":       selections[i]['shape'],
              "color":       selections[i]['color'],
              "description": selections[i]['description'].strip()}
@@ -1681,11 +1684,11 @@ def open_config_dialog():
 root = tk.Tk()
 root.title("LightingAI")
 root.configure(bg='#111419')
-root.resizable(False, False)
+root.resizable(False, True)
 
 root.update_idletasks()
 sw = root.winfo_screenwidth()
-root.geometry(f"296x540+{sw - 316}+44")
+root.geometry(f"296x680+{sw - 316}+44")
 
 root.attributes('-topmost', True)
 root.lift()
@@ -1712,12 +1715,34 @@ tk.Label(hdr, text="MIKA80-E · Rossmann",
 tk.Frame(root, bg=BORDER, height=1).pack(fill='x')
 
 
+# ── Scrollable content area ───────────────────────────────────────────────────
+_main_cv = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0)
+_main_sb = tk.Scrollbar(root, orient='vertical', command=_main_cv.yview)
+_main_cv.configure(yscrollcommand=_main_sb.set)
+_main_sb.pack(side='right', fill='y')
+_main_cv.pack(side='left', fill='both', expand=True)
+_sf = tk.Frame(_main_cv, bg=BG)
+_sf_win = _main_cv.create_window((0, 0), window=_sf, anchor='nw')
+
+def _on_sf_configure(e):
+    _main_cv.configure(scrollregion=_main_cv.bbox('all'))
+_sf.bind('<Configure>', _on_sf_configure)
+
+def _on_main_cv_configure(e):
+    _main_cv.itemconfig(_sf_win, width=e.width)
+_main_cv.bind('<Configure>', _on_main_cv_configure)
+
+def _on_main_scroll(e):
+    _main_cv.yview_scroll(int(-1 * (e.delta / 120)), 'units')
+root.bind('<MouseWheel>', _on_main_scroll)
+
+
 # ── Card factory ──────────────────────────────────────────────────────────────
 def make_card(step_num: str, title: str, desc: str,
               action, accent: str) -> None:
     """action is either a command string or a callable (for the config dialog)."""
 
-    outer = tk.Frame(root, bg=BG)
+    outer = tk.Frame(_sf, bg=BG)
     outer.pack(fill='x', padx=10, pady=(7, 0))
 
     tk.Frame(outer, bg=accent, width=5).pack(side='left', fill='y')
@@ -1794,8 +1819,8 @@ make_card(
 )
 
 # ── Utility row ───────────────────────────────────────────────────────────────
-tk.Frame(root, bg=BORDER, height=1).pack(fill='x', padx=10, pady=(10, 0))
-util_row = tk.Frame(root, bg=BG)
+tk.Frame(_sf, bg=BORDER, height=1).pack(fill='x', padx=10, pady=(10, 0))
+util_row = tk.Frame(_sf, bg=BG)
 util_row.pack(fill='x', padx=10, pady=6)
 
 for label, cmd in [('Clear All', 'LIGHTINGAI_CLEAR'), ('Status', 'LIGHTINGAI_STATUS')]:
@@ -1809,9 +1834,9 @@ for label, cmd in [('Clear All', 'LIGHTINGAI_CLEAR'), ('Status', 'LIGHTINGAI_STA
     b.pack(side='left', fill='x', expand=True, padx=(0, 4))
 
 # ── Luminaire Schedule panel ──────────────────────────────────────────────────
-tk.Frame(root, bg=BORDER, height=1).pack(fill='x', padx=10, pady=(6, 0))
+tk.Frame(_sf, bg=BORDER, height=1).pack(fill='x', padx=10, pady=(6, 0))
 
-sched_hdr = tk.Frame(root, bg=BG)
+sched_hdr = tk.Frame(_sf, bg=BG)
 sched_hdr.pack(fill='x', padx=10, pady=(6, 0))
 tk.Label(sched_hdr, text='Luminaire Schedule',
          font=('Helvetica', 11, 'bold'), bg=BG, fg=BRIGHT).pack(side='left')
@@ -1823,7 +1848,7 @@ _sched_refresh_btn = tk.Button(sched_hdr, text='↻',
                                cursor='hand2')
 _sched_refresh_btn.pack(side='right')
 
-sched_body = tk.Frame(root, bg=BG)
+sched_body = tk.Frame(_sf, bg=BG)
 sched_body.pack(fill='x', padx=10, pady=(2, 0))
 
 # Placeholder label — replaced by rows once summary.json exists
@@ -1900,8 +1925,8 @@ _sched_refresh_btn.configure(command=refresh_schedule)
 _poll_schedule()
 
 # ── Footer ────────────────────────────────────────────────────────────────────
-tk.Frame(root, bg=BORDER, height=1).pack(fill='x', padx=10, pady=(6, 0))
-tk.Label(root, text='Click a step · type LAI to reopen if closed',
+tk.Frame(_sf, bg=BORDER, height=1).pack(fill='x', padx=10, pady=(6, 0))
+tk.Label(_sf, text='Click a step · type LAI to reopen if closed',
          font=('Helvetica', 9), bg=BG, fg='#2e364a', pady=8).pack()
 
 root.mainloop()
