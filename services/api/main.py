@@ -28,7 +28,11 @@ from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from config import DWG_DIR, EXPORTS_DIR, CONCEPTS_DIR, MODELS_DIR
+from services.log import configure_logging
 import services.storage.db as db
+
+# Install pipeline logging at API startup — output goes to stderr alongside uvicorn
+configure_logging(verbose=False)
 
 app = FastAPI(title="lighting-ai", version="1.0.0",
               description="Automated Rossmann lighting design pipeline")
