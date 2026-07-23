@@ -21,10 +21,17 @@ Architecture:
 """
 from __future__ import annotations
 import math
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from shapely.geometry import Point, Polygon, MultiPoint
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from services.log import get_logger
+
+log = get_logger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -259,9 +266,16 @@ def generate_shelf_row_candidates(
 
         return clustered
 
+    _h_raw_count = len(h_rows)
+    _v_raw_count = len(v_cols)
     h_rows = _cluster_rows(h_rows)
-    # v_cols is keyed by x (column axis), same clustering applies to x-keys
     v_cols = _cluster_rows(v_cols)
+
+    log.info(f"Shelf rows (H): raw={_h_raw_count} → clustered={len(h_rows)} gondola rows")
+    for _gy, _xs in sorted(h_rows.items()):
+        log.debug(f"  H-row y={_gy/1000:.2f} m | {len(_xs)} positions  "
+                  f"x: {min(_xs)/1000:.1f}→{max(_xs)/1000:.1f} m")
+    log.info(f"Shelf cols (V): raw={_v_raw_count} → clustered={len(v_cols)} gondola cols")
 
     candidates: list[GridCandidate] = []
     seen_keys: set = set()
@@ -353,24 +367,30 @@ def generate_shelf_row_candidates(
             y1 = gondola_ys[idx]
             y2 = gondola_ys[idx + 1]
             if y2 - y1 < _MIN_AISLE_GAP:
-                continue   # too close — same gondola structure, not a real aisle
+                log.debug(f"  Skip pair y={y1/1000:.2f}↔{y2/1000:.2f} m: "
+                          f"gap={y2-y1:.0f} mm < {_MIN_AISLE_GAP:.0f} mm (same gondola)")
+                continue
             j_mid   = round(((y1 + y2) / 2.0 - oy) / pitch)
             y_aisle = j_mid * pitch + oy
-            # Clip to the x-extent where BOTH gondola rows face each other.
-            # Where only one row extends further, there is no bilateral aisle —
-            # those positions belong to wall or transition zones.
             _xs1, _xs2 = h_rows[y1], h_rows[y2]
             _x_lo = max(min(_xs1), min(_xs2))
             _x_hi = min(max(_xs1), max(_xs2))
             if _x_lo >= _x_hi:
-                continue  # rows don't share an x-range — no real aisle
+                log.debug(f"  Skip pair y={y1/1000:.2f}↔{y2/1000:.2f} m: "
+                          f"no shared x-range")
+                continue
             xs: list[float] = [x for x in {*_xs1, *_xs2} if _x_lo <= x <= _x_hi]
+            log.debug(f"  Aisle y={y_aisle/1000:.2f} m | between gondola rows "
+                      f"{y1/1000:.2f}↔{y2/1000:.2f} m | gap={y2-y1:.0f} mm | "
+                      f"x: {_x_lo/1000:.1f}→{_x_hi/1000:.1f} m")
             if y_aisle in aisle_rows:
                 xs = list({*aisle_rows[y_aisle], *xs})
             aisle_rows[y_aisle] = xs
     elif gondola_ys:
-        # Single gondola row — no pairing possible; fall back to direct placement
+        log.info("Single gondola row detected — using direct placement (no aisle pairing)")
         aisle_rows = dict(h_rows)
+
+    log.info(f"Aisles (H): {len(aisle_rows)} aisle rows detected")
 
     for gy, xs in aisle_rows.items():
         for lx in _run_positions_phased(xs, ox):
@@ -385,6 +405,8 @@ def generate_shelf_row_candidates(
                 candidates.append(GridCandidate(
                     x=round(cx, 1), y=round(cy, 1),
                     tile_i=i, tile_j=j, subposition=subpos))
+
+    log.info(f"Candidates generated: {len(candidates)} total (H-aisle pass)")
 
     # Wall gondola pass removed: previously placed candidates AT the gondola Y
     # (on the shelf body), which caused lights to appear inside gondola furniture.

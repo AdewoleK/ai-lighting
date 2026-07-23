@@ -17,6 +17,7 @@ All geometry is returned in model-space millimetres.
 """
 from __future__ import annotations
 import math
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -29,6 +30,9 @@ from shapely.ops import unary_union
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from config import DEFAULT_LAYER_MAP
+from services.log import get_logger
+
+log = get_logger(__name__)
 
 # Block/layer names that represent exclusion zones
 _EXCLUSION_BLOCKS  = {'rolltreppe','escalator','aufzug','lift','elevator',
@@ -268,6 +272,8 @@ class DWGParser:
                 from services.converter.dwg_converter import convert_dwg_to_dxf
                 filepath = convert_dwg_to_dxf(filepath)
 
+        log.info(f"Loading: {filepath.name}")
+
         plan = ParsedPlan(
             source_file=str(filepath),
             layer_map=self.layer_map,
@@ -276,19 +282,27 @@ class DWGParser:
         try:
             doc = ezdxf.readfile(str(filepath))
         except ezdxf.DXFStructureError:
-            # Try recovery mode for damaged files
+            log.warning("DXF structure error — trying recovery mode")
             doc, _ = ezdxf.recover.readfile(str(filepath))
 
         msp = doc.modelspace()
 
+        # Log layer inventory
+        all_layers = [l.dxf.name for l in doc.layers]
+        log.info(f"Layers in file: {len(all_layers)}")
+        log.debug(f"  Layer list: {', '.join(sorted(all_layers)[:40])}")
+
         wall_lines: list = []
         raw_polys: list[Polygon] = []
         exclusion_polys: list[Polygon] = []
+        _entity_counts: Counter = Counter()
 
         for entity in msp:
             etype = entity.dxftype()
             cat   = entity_category(entity, self._layer_sets)
             layer_up = entity.dxf.layer.upper()
+
+            _entity_counts[etype] += 1
 
             # ── Closed polylines → room boundaries, exclusions, or columns ─
             if etype == "LWPOLYLINE":
@@ -454,6 +468,36 @@ class DWGParser:
                             'y_mm': pos[1],
                         })
 
+        # ── Post-scan entity summary ───────────────────────────────────────
+        total_entities = sum(_entity_counts.values())
+        log.info(f"Entities scanned: {total_entities:,}  "
+                 f"({', '.join(f'{k}={v}' for k, v in _entity_counts.most_common(6))})")
+
+        # Furniture breakdown
+        by_type: Counter = Counter(f.inferred_type for f in plan.furniture)
+        log.info(f"Furniture blocks: {len(plan.furniture):,}  "
+                 f"({', '.join(f'{k}={v}' for k, v in by_type.most_common())})")
+
+        # Shelf details
+        shelf_objs = [f for f in plan.furniture if f.inferred_type == 'shelving']
+        if shelf_objs:
+            depth_counts: Counter = Counter(
+                (f.depth_code or 'unknown') for f in shelf_objs)
+            log.info(f"  Shelving: {len(shelf_objs)}  "
+                     f"depth codes: {dict(depth_counts.most_common(6))}")
+            assort_counts: Counter = Counter(
+                (f.assortment or '—') for f in shelf_objs)
+            top_assorts = [f"{k}={v}" for k, v in assort_counts.most_common(8)]
+            log.info(f"  Assortments: {', '.join(top_assorts)}")
+
+        # Zone labels found in DWG text
+        if plan.zone_labels:
+            for zl in plan.zone_labels:
+                a = f"{zl['area_m2']:.0f} m²" if zl.get('area_m2') else "area unknown"
+                log.info(f"  Zone label: '{zl['text'][:60]}' → {zl['zone_type']} ({a})")
+        else:
+            log.info("  No zone labels found in text annotations")
+
         # ── Polygonise loose wall lines ────────────────────────────────────
         if wall_lines:
             raw_polys.extend(lines_to_polygons(wall_lines))
@@ -463,6 +507,9 @@ class DWGParser:
         plan.building_envelope = self._find_building_envelope(plan.room_polygons, plan.furniture)
         plan.exclusion_zones = exclusion_polys
 
+        log.info(f"Room polygons: {len(plan.room_polygons)}")
+        log.info(f"Exclusion zones: {len(exclusion_polys)}")
+
         # ── Purge out-of-building shelf furniture ──────────────────────────
         # TEXT entities with shelf height codes ("57", "47", …) appear in
         # Rossmann title-block legend tables drawn at or near the DWG origin,
@@ -471,18 +518,33 @@ class DWGParser:
         # never reach the classifier or the placer.
         if plan.building_envelope is not None:
             from shapely.geometry import Point as _Pt
-            _env = plan.building_envelope.buffer(2000)   # 2 m tolerance for wall-edge items
+            _env = plan.building_envelope.buffer(2000)
+            _before_purge = len([f for f in plan.furniture if f.inferred_type == 'shelving'])
             plan.furniture = [
                 f for f in plan.furniture
                 if f.inferred_type != 'shelving'
                 or _env.covers(_Pt(f.position))
             ]
+            _after_purge = len([f for f in plan.furniture if f.inferred_type == 'shelving'])
+            if _before_purge != _after_purge:
+                log.info(f"  Purged {_before_purge - _after_purge} out-of-building shelf phantoms"
+                         f" ({_after_purge} shelves remain)")
+            eb = plan.building_envelope.bounds
+            log.info(f"Building envelope: "
+                     f"({eb[0]/1e6:.3f} M, {eb[1]/1e6:.3f} M) → "
+                     f"({eb[2]/1e6:.3f} M, {eb[3]/1e6:.3f} M)  "
+                     f"area={plan.building_envelope.area/1e6:.0f} m²")
+        else:
+            log.warning("Building envelope: not detected (no closed polylines found)")
 
         # ── Ceiling grid origin & pitch ────────────────────────────────────
-        # Only auto-detect if no annotation (Startmaß/Referenzmaß) already set it.
         if plan.grid_lines and plan.grid_origin_mm == (0.0, 0.0):
             plan.grid_origin_mm, plan.grid_pitch_mm = \
                 _detect_grid_origin_from_lines(plan.grid_lines)
+
+        log.info(f"Ceiling grid: pitch={plan.grid_pitch_mm:.0f} mm  "
+                 f"origin={plan.grid_origin_mm}  "
+                 f"grid-lines={len(plan.grid_lines)}")
 
         # ── Bounding box ───────────────────────────────────────────────────
         if plan.room_polygons:
@@ -493,6 +555,12 @@ class DWGParser:
             ys = [f.position[1] for f in plan.furniture]
             plan.bounds = (min(xs), min(ys), max(xs), max(ys))
 
+        if plan.bounds:
+            bw = (plan.bounds[2] - plan.bounds[0]) / 1000
+            bh = (plan.bounds[3] - plan.bounds[1]) / 1000
+            log.info(f"Plan bounds: {bw:.1f} m × {bh:.1f} m")
+
+        log.info("Parse complete")
         return plan
 
     # ── Helpers ───────────────────────────────────────────────────────────────

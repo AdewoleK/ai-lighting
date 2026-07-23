@@ -27,6 +27,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from config import API_HOST, API_PORT, EXPORTS_DIR, CONCEPTS_DIR
+from services.log import configure_logging, get_logger
+
+log = get_logger(__name__)
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -35,7 +38,10 @@ def run_pipeline(file_path: str, pdf_fallback: str = None,
                  concept_id: str = "rossmann_standard",
                  project_name: str = "Lighting Project",
                  customer: str = "Dirk Rossmann GmbH",
-                 demo: bool = False) -> dict:
+                 demo: bool = False,
+                 verbose: bool = False) -> dict:
+
+    configure_logging(verbose=verbose)
 
     from services.parser.pdf_parser import RealPlanParser
     from services.classifier.room_classifier_real import RealRoomClassifier
@@ -195,9 +201,10 @@ def run_validate():
 
 def run_api():
     import uvicorn
+    configure_logging(verbose=False)
     _ensure_concept()
-    print(f"Starting lighting-ai API on http://{API_HOST}:{API_PORT}")
-    print(f"  Swagger docs: http://{API_HOST}:{API_PORT}/docs")
+    log.info(f"Starting lighting-ai API on http://{API_HOST}:{API_PORT}")
+    log.info(f"  Swagger docs: http://{API_HOST}:{API_PORT}/docs")
     uvicorn.run("services.api.main:app", host=API_HOST,
                 port=API_PORT, reload=True)
 
@@ -311,6 +318,8 @@ def main():
     pp.add_argument("--customer",     default="Dirk Rossmann GmbH")
     pp.add_argument("--demo",         action="store_true",
                     help="Run on real uploaded plan (or synthetic if not found)")
+    pp.add_argument("--verbose", "-v", action="store_true",
+                    help="Show detailed debug output (every row, every candidate)")
 
     # api
     sub.add_parser("api", help="Start FastAPI server")
@@ -342,7 +351,8 @@ def main():
         _ensure_models()
         run_pipeline(file_path=args.file, pdf_fallback=args.pdf_fallback,
                      concept_id=args.concept, project_name=args.project_name,
-                     customer=args.customer, demo=args.demo)
+                     customer=args.customer, demo=args.demo,
+                     verbose=getattr(args, 'verbose', False))
     elif args.mode == "api":
         _ensure_models()
         run_api()
