@@ -632,9 +632,31 @@ def open_analysis_dialog():
 
 
 # ── Step 1: grid line-thickness + color picker ───────────────────────────────
-_GRID_CFG_FILE  = pathlib.Path.home() / "ai-lighting" / "lightingai_grid_config.json"
+_GRID_CFG_FILE       = pathlib.Path.home() / "ai-lighting" / "lightingai_grid_config.json"
+_TYPECONFIG_FILE     = pathlib.Path.home() / "ai-lighting" / "lightingai_typeconfig.json"
 _CUSTOM_DESCS_FILE   = pathlib.Path.home() / "ai-lighting" / "lightingai_custom_descs.json"
 _MAX_CUSTOM_DESCS    = 15
+
+# ── One-time migration: fix duplicate default shapes written by older versions ─
+def _migrate_typeconfig() -> None:
+    """Patch stale entries that were written when AW and P shared shapes."""
+    _STALE = {"AW": ("Circle", "Star"), "P": ("Hexagon", "Pentagon")}
+    if not _TYPECONFIG_FILE.exists():
+        return
+    try:
+        entries = json.loads(_TYPECONFIG_FILE.read_text(encoding="utf-8"))
+        changed = False
+        for e in entries:
+            t = e.get("type", "")
+            if t in _STALE and e.get("shape") == _STALE[t][0]:
+                e["shape"] = _STALE[t][1]
+                changed = True
+        if changed:
+            _TYPECONFIG_FILE.write_text(json.dumps(entries, ensure_ascii=False))
+    except Exception:
+        pass
+
+_migrate_typeconfig()
 _API_BASE            = "http://localhost:8000"
 _last_dwg_path:   list = [None]   # mutable cell — pathlib.Path or None
 _last_job_result: list = [None]   # mutable cell — result dict or None
@@ -1838,8 +1860,6 @@ for label, cmd in [('Clear All', 'LIGHTINGAI_CLEAR'), ('Status', 'LIGHTINGAI_STA
     b.pack(side='left', fill='x', expand=True, padx=(0, 4))
 
 # ── Luminaire Types panel ─────────────────────────────────────────────────────
-_TYPECONFIG_FILE = pathlib.Path.home() / "ai-lighting" / "lightingai_typeconfig.json"
-
 tk.Frame(_sf, bg=BORDER, height=1).pack(fill='x', padx=10, pady=(6, 0))
 
 _lt_hdr = tk.Frame(_sf, bg=BG)
